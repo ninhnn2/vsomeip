@@ -245,6 +245,9 @@ public:
     VSOMEIP_EXPORT bool is_secure_service(service_t _service, instance_t _instance) const;
 
     VSOMEIP_EXPORT int get_udp_receive_buffer_size() const;
+    VSOMEIP_EXPORT bool is_dtls_enabled() const override;
+    VSOMEIP_EXPORT const std::string& get_dtls_psk_identity() const override;
+    VSOMEIP_EXPORT const std::string& get_dtls_psk() const override;
 
     VSOMEIP_EXPORT bool is_tp_client(service_t _service, instance_t _instance, method_t _method) const;
     VSOMEIP_EXPORT bool is_tp_service(service_t _service, instance_t _instance, method_t _method) const;
@@ -364,6 +367,7 @@ private:
     void load_acceptance_data(const boost::property_tree::ptree& _tree);
     void load_activation_file_path(std::set<std::string>& _path, const boost::property_tree::ptree& _tree);
     void load_udp_receive_buffer_size(const configuration_element& _element);
+    void load_dtls(const configuration_element& _element);
     bool load_npdu_debounce_times_configuration(const std::shared_ptr<service>& _service, const boost::property_tree::ptree& _tree);
     bool load_npdu_debounce_times_for_service(const std::shared_ptr<service>& _service, bool _is_request,
                                               const boost::property_tree::ptree& _tree);
@@ -626,6 +630,10 @@ protected:
     std::atomic_bool is_security_external_;
     std::atomic_bool is_security_audit_;
     std::atomic_bool is_remote_access_allowed_;
+
+    bool dtls_enabled_{false};
+    std::string dtls_psk_identity_;
+    std::string dtls_psk_;
 
     routing_state_e initial_routing_state_;
 

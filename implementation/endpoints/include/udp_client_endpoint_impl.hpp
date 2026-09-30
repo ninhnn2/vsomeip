@@ -13,6 +13,7 @@
 #include <vsomeip/defines.hpp>
 
 #include "client_endpoint_impl.hpp"
+#include "dtls_session.hpp"
 #include "tp_reassembler.hpp"
 
 namespace vsomeip_v3 {
@@ -51,8 +52,18 @@ private:
     void get_configured_times_from_endpoint(service_t _service, method_t _method, std::chrono::nanoseconds* _debouncing,
                                             std::chrono::nanoseconds* _maximum_retention) const;
     void connect();
+    void connect_cbk(const boost::system::error_code& _error);
     void receive() override;
     void receive(std::shared_ptr<message_buffer_t> _recv_buffer);
+    void receive_cbk_impl(boost::system::error_code const& _error, size_t _bytes, std::shared_ptr<message_buffer_t> _recv_buffer,
+                          bool _rearm);
+    void wait_tp_separation_time(uint32_t _separation_time);
+
+    // DTLS is used for unicast service endpoints only; SD and multicast stay plaintext.
+    bool use_dtls() const;
+    void send_queued_dtls(std::pair<message_buffer_ptr_t, uint32_t>& _entry);
+    void handle_dtls_datagram(boost::system::error_code const& _error, size_t _bytes, std::shared_ptr<message_buffer_t> _recv_buffer);
+    void resume_dtls_queue();
     std::string get_address_port_remote() const;
     std::string get_address_port_local() const;
     std::string get_remote_information() const;
@@ -65,6 +76,7 @@ private:
     const uint16_t remote_port_;
     const int udp_receive_buffer_size_;
     std::shared_ptr<tp::tp_reassembler> tp_reassembler_;
+    std::shared_ptr<dtls_session> dtls_session_;
     std::chrono::steady_clock::time_point last_sent_;
 };
 

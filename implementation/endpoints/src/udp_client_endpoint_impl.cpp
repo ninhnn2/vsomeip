@@ -10,6 +10,7 @@
 #include <boost/asio/bind_executor.hpp>
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/ip/multicast.hpp>
+#include <boost/asio/post.hpp>
 
 #include "logger_ext.hpp"
 #include "../include/boardnet_endpoint_host.hpp"
@@ -47,6 +48,9 @@ bool udp_client_endpoint_impl::is_local() const {
 }
 
 void udp_client_endpoint_impl::connect() {
+    // A reconnect must not reuse the DTLS session of the previous socket.
+    dtls_session_.reset();
+
     std::unique_lock its_lock(socket_mutex_);
     boost::system::error_code its_error;
     socket_->open(remote_.protocol(), its_error);
@@ -155,7 +159,84 @@ void udp_client_endpoint_impl::connect() {
         socket_->async_connect(remote_, boost::asio::bind_executor(strand_, [self](const auto& _error) { self->connect_cbk(_error); }));
     } else {
         VSOMEIP_WARNING_P << "Error opening socket: " << its_error.message() << " remote:" << get_address_port_remote();
-        boost::asio::post(strand_, std::bind(&udp_client_endpoint_base_impl::connect_cbk, shared_from_this(), its_error));
+        auto self = std::dynamic_pointer_cast<udp_client_endpoint_impl>(shared_from_this());
+        boost::asio::post(strand_, [self, its_error]() { self->connect_cbk(its_error); });
+    }
+}
+
+void udp_client_endpoint_impl::connect_cbk(const boost::system::error_code& _error) {
+    udp_client_endpoint_base_impl::connect_cbk(_error);
+
+    if (_error || !use_dtls() || endpoint_impl<boost::asio::ip::udp>::sending_blocked_) {
+        return;
+    }
+
+    auto self = std::dynamic_pointer_cast<udp_client_endpoint_impl>(shared_from_this());
+    std::weak_ptr<udp_client_endpoint_impl> its_weak_self(self);
+
+    dtls_session_ = dtls_session::create(
+            io_, true, configuration_->get_dtls_psk_identity(), configuration_->get_dtls_psk(),
+            [its_weak_self](dtls_session::datagram_t _data, dtls_session::send_completion_t _completion) {
+                auto its_endpoint = its_weak_self.lock();
+                if (!its_endpoint) {
+                    if (_completion) {
+                        _completion(false);
+                    }
+                    return;
+                }
+
+                auto its_payload = std::make_shared<dtls_session::datagram_t>(std::move(_data));
+                std::scoped_lock its_socket_lock(its_endpoint->socket_mutex_);
+                if (!its_endpoint->socket_ || !its_endpoint->socket_->is_open()) {
+                    if (_completion) {
+                        _completion(false);
+                    }
+                    return;
+                }
+                its_endpoint->socket_->async_send(boost::asio::buffer(*its_payload),
+                                                  [its_payload, _completion = std::move(_completion)](
+                                                          const boost::system::error_code& _send_error, std::size_t) mutable {
+                                                      if (_completion) {
+                                                          _completion(!_send_error);
+                                                      }
+                                                  });
+            },
+            [its_weak_self](dtls_session::datagram_t _data) {
+                if (auto its_endpoint = its_weak_self.lock()) {
+                    boost::asio::post(its_endpoint->strand_, [its_endpoint, _data = std::move(_data)]() mutable {
+                        // Authenticated plaintext only: hand it to the normal parser, but do
+                        // not re-arm the socket read from here.
+                        auto its_buffer = std::make_shared<message_buffer_t>(_data.begin(), _data.end());
+                        its_endpoint->receive_cbk_impl({}, its_buffer->size(), its_buffer, false);
+                        its_endpoint->resume_dtls_queue();
+                    });
+                }
+            });
+
+    if (!dtls_session_) {
+        VSOMEIP_ERROR_P << "DTLS: could not initialize client endpoint " << get_remote_information();
+        return;
+    }
+
+    dtls_session_->start();
+}
+
+bool udp_client_endpoint_impl::use_dtls() const {
+    return configuration_->is_dtls_enabled() && !remote_address_.is_multicast() && remote_port_ != configuration_->get_sd_port();
+}
+
+void udp_client_endpoint_impl::resume_dtls_queue() {
+    if (!dtls_session_ || !dtls_session_->is_ready()) {
+        return;
+    }
+
+    std::scoped_lock its_lock(mutex_);
+    if (!queue_.empty() && !is_sending_) {
+        auto its_entry = get_front();
+        if (its_entry.first) {
+            is_sending_ = true;
+            send_queued(its_entry);
+        }
     }
 }
 
@@ -180,7 +261,66 @@ void udp_client_endpoint_impl::restart(bool _force) {
     start_connect_timer();
 }
 
+void udp_client_endpoint_impl::wait_tp_separation_time(uint32_t _separation_time) {
+    // Check whether we need to wait (SOME/IP-TP separation time)
+    if (_separation_time > 0) {
+        if (last_sent_ != std::chrono::steady_clock::time_point()) {
+            const auto its_elapsed =
+                    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - last_sent_).count();
+            if (_separation_time > its_elapsed) {
+                std::this_thread::sleep_for(std::chrono::microseconds(_separation_time - its_elapsed));
+            }
+        }
+        last_sent_ = std::chrono::steady_clock::now();
+    } else {
+        last_sent_ = std::chrono::steady_clock::time_point();
+    }
+}
+
+void udp_client_endpoint_impl::send_queued_dtls(std::pair<message_buffer_ptr_t, uint32_t>& _entry) {
+    // OpenSSL can emit records synchronously from write(), and the send handler takes
+    // socket_mutex_ itself, so this path must not hold that lock while writing.
+    {
+        std::scoped_lock its_socket_lock(socket_mutex_);
+        if (!socket_->is_open()) {
+            VSOMEIP_WARNING_P << "socket is closed";
+            state_ = cei_state_e::CLOSED;
+            was_not_connected_ = true;
+            is_sending_ = false;
+            return;
+        }
+    }
+
+    auto its_session = dtls_session_;
+    if (!its_session || !its_session->is_ready()) {
+        // Handshake is not finished yet. Leave the entry queued; resume_dtls_queue()
+        // picks it up once the session is ready.
+        is_sending_ = false;
+        return;
+    }
+
+    wait_tp_separation_time(_entry.second);
+
+    auto self = std::dynamic_pointer_cast<udp_client_endpoint_impl>(shared_from_this());
+    auto its_message = _entry.first;
+    const bool its_queued = its_session->write(its_message->data(), its_message->size(), [self, its_message](bool _ok) {
+        boost::asio::post(self->strand_, [self, its_message, _ok]() {
+            const boost::system::error_code its_error = _ok ? boost::system::error_code{} : boost::asio::error::operation_aborted;
+            self->send_cbk(its_error, _ok ? its_message->size() : 0U, its_message);
+        });
+    });
+
+    if (!its_queued) {
+        is_sending_ = false;
+    }
+}
+
 void udp_client_endpoint_impl::send_queued(std::pair<message_buffer_ptr_t, uint32_t>& _entry) {
+    if (use_dtls()) {
+        send_queued_dtls(_entry);
+        return;
+    }
+
     std::scoped_lock its_socket_lock(socket_mutex_);
 
     if (!socket_->is_open()) {
@@ -191,19 +331,7 @@ void udp_client_endpoint_impl::send_queued(std::pair<message_buffer_ptr_t, uint3
         return;
     }
 
-    // Check whether we need to wait (SOME/IP-TP separation time)
-    if (_entry.second > 0) {
-        if (last_sent_ != std::chrono::steady_clock::time_point()) {
-            const auto its_elapsed =
-                    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - last_sent_).count();
-            if (_entry.second > its_elapsed) {
-                std::this_thread::sleep_for(std::chrono::microseconds(_entry.second - its_elapsed));
-            }
-        }
-        last_sent_ = std::chrono::steady_clock::now();
-    } else {
-        last_sent_ = std::chrono::steady_clock::time_point();
-    }
+    wait_tp_separation_time(_entry.second);
     // Send
     socket_->async_send(boost::asio::buffer(*_entry.first),
                         std::bind(&udp_client_endpoint_base_impl::send_cbk, shared_from_this(), std::placeholders::_1,
@@ -266,6 +394,51 @@ void udp_client_endpoint_impl::receive_cbk(boost::system::error_code const& _err
         return;
     }
 
+    if (use_dtls()) {
+        handle_dtls_datagram(_error, _bytes, std::move(_recv_buffer));
+        return;
+    }
+
+    receive_cbk_impl(_error, _bytes, std::move(_recv_buffer), true);
+}
+
+void udp_client_endpoint_impl::handle_dtls_datagram(boost::system::error_code const& _error, size_t _bytes,
+                                                   std::shared_ptr<message_buffer_t> _recv_buffer) {
+    if (!dtls_session_) {
+        // DTLS was requested but no session exists. Drop the datagram instead of
+        // interpreting it as plaintext SOME/IP - there is no plaintext downgrade.
+        if (!_error) {
+            receive(std::move(_recv_buffer));
+        }
+        return;
+    }
+
+    if (!_error && _bytes > 0) {
+        dtls_session_->feed(_recv_buffer->data(), _bytes);
+        if (dtls_session_->is_failed()) {
+            VSOMEIP_WARNING_P << "DTLS: session failed, reconnecting. remote: " << get_address_port_remote();
+            notify_disconnect();
+            restart(true);
+            return;
+        }
+        resume_dtls_queue();
+    }
+
+    if (_error == boost::asio::error::connection_refused) {
+        VSOMEIP_WARNING_P << "local: " << get_address_port_local() << " remote: " << get_address_port_remote()
+                          << " error: " << _error.message();
+        close_socket(false, true);
+        notify_disconnect();
+        return;
+    }
+
+    receive(std::move(_recv_buffer));
+}
+
+// Shared parser for socket datagrams and for plaintext recovered from DTLS. The
+// decrypted path must not re-arm the socket read, hence _rearm.
+void udp_client_endpoint_impl::receive_cbk_impl(boost::system::error_code const& _error, size_t _bytes,
+                                                std::shared_ptr<message_buffer_t> _recv_buffer, bool _rearm) {
     std::shared_ptr<boardnet_routing_host> its_host = routing_host_.lock();
     if (!_error && 0 < _bytes && its_host) {
         // reject UDP packets larger than 1416 (16 bytes full header + 1400 payload); see Section 4.1.2.9 "Payload" in AUTOSAR FO R22-11
@@ -276,13 +449,17 @@ void udp_client_endpoint_impl::receive_cbk(boost::system::error_code const& _err
             VSOMEIP_ERROR_P << "Received a packet that is bigger than VSOMEIP_MAX_UDP_MESSAGE_SIZE (" << VSOMEIP_MAX_UDP_MESSAGE_SIZE
                             << ") bytes with " << _bytes << " bytes in " << local_ << ", " << socket_.get() << " from " << remote_
                             << ". Message will be dropped" << " pdu: " << utility::dump(&(*_recv_buffer)[0], _bytes);
-            receive(std::move(_recv_buffer));
+            if (_rearm) {
+                receive(std::move(_recv_buffer));
+            }
             return;
         } else if (_bytes < VSOMEIP_FULL_HEADER_SIZE) {
             VSOMEIP_ERROR_P << "ucei::" << __func__
                             << ": Dropping packet that is smaller than VSOMEIP_FULL_HEADER_SIZE (16). size=" << _bytes
                             << " remote=" << remote_ << " pdu: " << utility::dump(&(*_recv_buffer)[0], _bytes);
-            receive(std::move(_recv_buffer));
+            if (_rearm) {
+                receive(std::move(_recv_buffer));
+            }
             return;
         }
 
@@ -295,7 +472,9 @@ void udp_client_endpoint_impl::receive_cbk(boost::system::error_code const& _err
                 VSOMEIP_ERROR_P << "Message size exceeds allowed maximum: " << current_message_size
                                 << make_buffer_dump(get_address_port_local(), get_address_port_remote(), i, current_message_size,
                                                     remaining_bytes, &(*_recv_buffer)[0], _bytes);
-                receive(std::move(_recv_buffer));
+                if (_rearm) {
+                    receive(std::move(_recv_buffer));
+                }
                 return;
             }
 
@@ -304,7 +483,9 @@ void udp_client_endpoint_impl::receive_cbk(boost::system::error_code const& _err
                     VSOMEIP_ERROR_P << "Buffer underflow in udp client endpoint ~> abort!"
                                     << make_buffer_dump(get_address_port_local(), get_address_port_remote(), i, current_message_size,
                                                         remaining_bytes, &(*_recv_buffer)[0], _bytes);
-                    receive(std::move(_recv_buffer));
+                    if (_rearm) {
+                        receive(std::move(_recv_buffer));
+                    }
                     return;
                 } else if (current_message_size > VSOMEIP_RETURN_CODE_POS
                            && ((*_recv_buffer)[i + VSOMEIP_PROTOCOL_VERSION_POS] != VSOMEIP_PROTOCOL_VERSION
@@ -328,7 +509,9 @@ void udp_client_endpoint_impl::receive_cbk(boost::system::error_code const& _err
                                                             remaining_bytes, &(*_recv_buffer)[0], _bytes);
                     }
 
-                    receive(std::move(_recv_buffer));
+                    if (_rearm) {
+                        receive(std::move(_recv_buffer));
+                    }
                     return;
                 } else if (tp::tp::tp_flag_is_set((*_recv_buffer)[i + VSOMEIP_MESSAGE_TYPE_POS])) {
                     const auto res =
@@ -352,7 +535,9 @@ void udp_client_endpoint_impl::receive_cbk(boost::system::error_code const& _err
     }
 
     if (!_error) {
-        receive(std::move(_recv_buffer));
+        if (_rearm) {
+            receive(std::move(_recv_buffer));
+        }
     } else {
         if (_error == boost::asio::error::connection_refused) {
             VSOMEIP_WARNING_P << "local: " << get_address_port_local() << " remote: " << get_address_port_remote()
@@ -360,7 +545,9 @@ void udp_client_endpoint_impl::receive_cbk(boost::system::error_code const& _err
             close_socket(false, true);
             notify_disconnect();
         } else {
-            receive(std::move(_recv_buffer));
+            if (_rearm) {
+                receive(std::move(_recv_buffer));
+            }
         }
     }
 }

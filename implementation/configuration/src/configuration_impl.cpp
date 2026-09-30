@@ -190,6 +190,9 @@ configuration_impl::configuration_impl(const configuration_impl& _other) :
     is_security_external_ = _other.is_security_external_.load();
     is_security_audit_ = _other.is_security_audit_.load();
     is_remote_access_allowed_ = _other.is_remote_access_allowed_.load();
+    dtls_enabled_ = _other.dtls_enabled_;
+    dtls_psk_identity_ = _other.dtls_psk_identity_;
+    dtls_psk_ = _other.dtls_psk_;
 }
 
 configuration_impl::~configuration_impl() { }
@@ -622,6 +625,7 @@ bool configuration_impl::load_data(const std::vector<configuration_element>& _el
             load_security(e);
             load_tracing(e);
             load_udp_receive_buffer_size(e);
+            load_dtls(e);
             load_services(e);
             load_request_debounce_time(e);
             load_dispatch_defaults(e);
@@ -4353,6 +4357,65 @@ void configuration_impl::load_someip_tp_for_service(const std::shared_ptr<servic
     }
 }
 
+void configuration_impl::load_dtls(const configuration_element& _element) {
+    const auto its_settings = _element.tree_.get_child_optional("dtls");
+    if (!its_settings) {
+        return;
+    }
+
+    // A present but malformed DTLS object is treated as enabled, so that bad
+    // credentials fail closed in the endpoint instead of silently downgrading
+    // the traffic to plaintext.
+    dtls_enabled_ = true;
+    try {
+        const bool its_enabled = its_settings->get<bool>("enable", false);
+        dtls_enabled_ = its_enabled;
+
+        const std::string its_identity = its_settings->get<std::string>("psk-identity", "");
+        std::string its_key = its_settings->get<std::string>("psk-key", "");
+        const std::string its_key_file = its_settings->get<std::string>("psk-key-file", "");
+
+        if (!its_key_file.empty()) {
+            boost::filesystem::path its_resolved_key_file(its_key_file);
+            if (its_resolved_key_file.is_relative()) {
+                its_resolved_key_file =
+                        boost::filesystem::path(_element.name_).parent_path() / its_resolved_key_file;
+            }
+
+            std::ifstream its_input(its_resolved_key_file.string());
+            if (!its_input) {
+                VSOMEIP_ERROR << "DTLS PSK file could not be read: " << its_resolved_key_file.string();
+                dtls_psk_identity_.clear();
+                dtls_psk_.clear();
+                return;
+            }
+
+            std::getline(its_input, its_key);
+            trim(its_key);
+        }
+
+        if (its_enabled && (its_identity.empty() || its_key.size() < 32U || (its_key.size() % 2U) != 0U)) {
+            VSOMEIP_ERROR << "DTLS configuration requires psk-identity and a hexadecimal "
+                             "psk-key of at least 16 bytes";
+            dtls_psk_identity_.clear();
+            dtls_psk_.clear();
+            return;
+        }
+
+        dtls_psk_identity_ = its_identity;
+        dtls_psk_ = its_key;
+
+        if (dtls_enabled_) {
+            VSOMEIP_WARNING << "DTLS PSK is enabled for UDP unicast service endpoints; "
+                               "keep the key file private";
+        }
+    } catch (const std::exception& e) {
+        VSOMEIP_ERROR << "Invalid DTLS configuration: " << e.what();
+        dtls_psk_identity_.clear();
+        dtls_psk_.clear();
+    }
+}
+
 void configuration_impl::load_udp_receive_buffer_size(const configuration_element& _element) {
     const std::string its_buffer_size("udp-receive-buffer-size");
     try {
@@ -4754,6 +4817,21 @@ bool configuration_impl::is_secure_service(service_t _service, instance_t _insta
 int configuration_impl::get_udp_receive_buffer_size() const {
 
     return udp_receive_buffer_size_;
+}
+
+bool configuration_impl::is_dtls_enabled() const {
+
+    return dtls_enabled_;
+}
+
+const std::string& configuration_impl::get_dtls_psk_identity() const {
+
+    return dtls_psk_identity_;
+}
+
+const std::string& configuration_impl::get_dtls_psk() const {
+
+    return dtls_psk_;
 }
 
 bool configuration_impl::is_tp_client(service_t _service, instance_t _instance, method_t _method) const {

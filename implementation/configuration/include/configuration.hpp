@@ -297,6 +297,21 @@ public:
     virtual bool is_security_external() const = 0;
     virtual bool is_security_audit() const = 0;
     virtual bool is_remote_access_allowed() const = 0;
+
+    // Optional DTLS transport settings. Appended with default implementations to
+    // keep this interface usable by configuration providers that do not know
+    // about DTLS.
+    virtual bool is_dtls_enabled() const { return false; }
+
+    virtual const std::string& get_dtls_psk_identity() const {
+        static const std::string empty;
+        return empty;
+    }
+
+    virtual const std::string& get_dtls_psk() const {
+        static const std::string empty;
+        return empty;
+    }
 };
 
 /// Inclusive port range.

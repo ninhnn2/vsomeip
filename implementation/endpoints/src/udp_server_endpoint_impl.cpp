@@ -9,6 +9,7 @@
 #include <boost/asio/ip/multicast.hpp>
 #include <boost/asio/ip/network_v4.hpp>
 #include <boost/asio/ip/network_v6.hpp>
+#include <boost/asio/post.hpp>
 
 #include <vsomeip/constants.hpp>
 
@@ -272,6 +273,7 @@ void udp_server_endpoint_impl::stop_unlocked() {
 
     unicast_socket_.reset();
     multicast_socket_.reset();
+    dtls_sessions_.clear();
     tp_reassembler_->stop();
 }
 
@@ -425,6 +427,10 @@ bool udp_server_endpoint_impl::send_queued_unlocked(const target_data_iterator_t
         last_sent_ = std::chrono::steady_clock::time_point();
     }
 
+    if (use_dtls() && !_it->first.address().is_multicast()) {
+        return send_queued_dtls_unlocked(_it);
+    }
+
     if (auto its_me{std::dynamic_pointer_cast<udp_server_endpoint_impl>(shared_from_this())}) {
         auto its_buffer = its_entry.first;
         auto its_target = _it->first;
@@ -443,6 +449,55 @@ bool udp_server_endpoint_impl::send_queued_unlocked(const target_data_iterator_t
         VSOMEIP_ERROR_P << instance_name_ << " Failed to cast to udp_server_endpoint_impl";
         return false;
     }
+}
+
+bool udp_server_endpoint_impl::use_dtls() const {
+    return configuration_->is_dtls_enabled() && local_.port() != configuration_->get_sd_port();
+}
+
+std::string udp_server_endpoint_impl::dtls_peer_key(const endpoint_type& _peer) const {
+    return _peer.address().to_string() + ":" + std::to_string(_peer.port());
+}
+
+bool udp_server_endpoint_impl::send_queued_dtls_unlocked(const target_data_iterator_type _it) {
+    // The caller holds `mutex_` and `sync_`; the session lookup is therefore safe,
+    // but nothing below may take `sync_` again.
+
+    const auto its_entry = _it->second.queue_.front();
+    const auto its_session_it = dtls_sessions_.find(dtls_peer_key(_it->first));
+    if (its_session_it == dtls_sessions_.end() || !its_session_it->second->is_ready()) {
+        // No handshaked session for this peer yet - drop instead of falling back to
+        // plaintext. The peer re-sends and the handshake completes on its datagrams.
+        _it->second.is_sending_ = false;
+        return false;
+    }
+
+    auto its_me = std::dynamic_pointer_cast<udp_server_endpoint_impl>(shared_from_this());
+    if (!its_me) {
+        VSOMEIP_ERROR_P << instance_name_ << " Failed to cast to udp_server_endpoint_impl";
+        return false;
+    }
+
+    auto its_session = its_session_it->second;
+    auto its_buffer = its_entry.first;
+    auto its_target = _it->first;
+
+    _it->second.is_sending_ = true;
+    const bool its_queued = its_session->write(its_buffer->data(), its_buffer->size(), [its_me, its_buffer, its_target](bool _ok) {
+        boost::asio::post(its_me->io_, [its_me, its_buffer, its_target, _ok]() {
+            const boost::system::error_code its_error = _ok ? boost::system::error_code{} : boost::asio::error::operation_aborted;
+            if (_ok && its_me->on_unicast_sent_ && !its_target.address().is_multicast()) {
+                its_me->on_unicast_sent_(its_buffer->data(), static_cast<uint32_t>(its_buffer->size()), its_target.address());
+            }
+            its_me->send_cbk(its_target, its_error, _ok ? its_buffer->size() : 0U);
+        });
+    });
+
+    if (!its_queued) {
+        _it->second.is_sending_ = false;
+    }
+
+    return false;
 }
 
 void udp_server_endpoint_impl::get_configured_times_from_endpoint(service_t _service, method_t _method,
@@ -567,8 +622,93 @@ void udp_server_endpoint_impl::on_unicast_received(const boost::system::error_co
 
     if (_error) {
         VSOMEIP_ERROR_P << instance_name_ << _error.message();
+    } else if (use_dtls() && _bytes > 0) {
+        feed_dtls_unicast(_unicast_recv_buffer, _bytes);
     } else {
         on_message_received_unlocked(_error, _bytes, false, unicast_remote_, _unicast_recv_buffer);
+    }
+}
+
+void udp_server_endpoint_impl::feed_dtls_unicast(const message_buffer_t& _unicast_recv_buffer, size_t _bytes) {
+    // The caller shall not hold the lock
+
+    const endpoint_type its_peer = unicast_remote_;
+    const std::string its_key = dtls_peer_key(its_peer);
+
+    std::shared_ptr<dtls_session> its_session;
+    {
+        std::scoped_lock its_lock(sync_);
+
+        auto its_found = dtls_sessions_.find(its_key);
+        if (its_found != dtls_sessions_.end()) {
+            if (its_found->second->is_failed()) {
+                dtls_sessions_.erase(its_found);
+            } else {
+                its_session = its_found->second;
+            }
+        }
+
+        if (!its_session && unicast_socket_ && unicast_socket_->is_open()) {
+            auto its_weak_self = std::weak_ptr<udp_server_endpoint_impl>(shared_ptr());
+            its_session = dtls_session::create(
+                    io_, false, configuration_->get_dtls_psk_identity(), configuration_->get_dtls_psk(),
+                    [its_weak_self, its_peer](dtls_session::datagram_t _data, dtls_session::send_completion_t _completion) {
+                        // Post: write() can be called with sync_ held, and the send needs it.
+                        auto its_self = its_weak_self.lock();
+                        if (!its_self) {
+                            if (_completion) {
+                                _completion(false);
+                            }
+                            return;
+                        }
+                        auto its_payload = std::make_shared<dtls_session::datagram_t>(std::move(_data));
+                        boost::asio::post(its_self->io_, [its_self, its_peer, its_payload,
+                                                          _completion = std::move(_completion)]() mutable {
+                            std::scoped_lock its_lock(its_self->sync_);
+                            if (!its_self->unicast_socket_ || !its_self->unicast_socket_->is_open()) {
+                                if (_completion) {
+                                    _completion(false);
+                                }
+                                return;
+                            }
+                            its_self->unicast_socket_->async_send_to(
+                                    boost::asio::buffer(its_payload->data(), its_payload->size()), its_peer,
+                                    [its_payload, _completion = std::move(_completion)](const boost::system::error_code& _send_error,
+                                                                                       size_t) mutable {
+                                        if (_completion) {
+                                            _completion(!_send_error);
+                                        }
+                                    });
+                        });
+                    },
+                    [its_weak_self, its_peer](dtls_session::datagram_t _data) {
+                        if (auto its_self = its_weak_self.lock()) {
+                            boost::asio::post(its_self->io_, [its_self, its_peer, _data = std::move(_data)]() mutable {
+                                // Authenticated plaintext only.
+                                message_buffer_t its_plaintext(_data.begin(), _data.end());
+                                its_self->on_message_received_unlocked({}, its_plaintext.size(), false, its_peer, its_plaintext);
+                            });
+                        }
+                    });
+
+            if (its_session) {
+                dtls_sessions_.emplace(its_key, its_session);
+            }
+        }
+    }
+
+    if (!its_session) {
+        VSOMEIP_ERROR_P << instance_name_ << " Failed to initialize DTLS session for " << its_key;
+        return;
+    }
+
+    its_session->feed(_unicast_recv_buffer.data(), _bytes);
+    if (its_session->is_failed()) {
+        std::scoped_lock its_lock(sync_);
+        const auto its_current = dtls_sessions_.find(its_key);
+        if (its_current != dtls_sessions_.end() && its_current->second == its_session) {
+            dtls_sessions_.erase(its_current);
+        }
     }
 }
 

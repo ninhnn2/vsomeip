@@ -109,7 +109,9 @@ cc_library_shared {
     shared_libs: [
         "libboost_system",
         "libboost_filesystem",
+        "libcrypto",
         "liblog",
+        "libssl",
         "libutils"
     ]
 }

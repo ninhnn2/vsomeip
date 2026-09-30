@@ -9,6 +9,7 @@
 #include <vsomeip/defines.hpp>
 
 #include "server_endpoint_impl.hpp"
+#include "dtls_session.hpp"
 #include "tp_reassembler.hpp"
 #include "udp_socket.hpp"
 
@@ -107,6 +108,12 @@ private:
 
     bool is_same_subnet_unlocked(const boost::asio::ip::address& _address) const;
 
+    // DTLS is used for unicast service endpoints only; SD and multicast stay plaintext.
+    bool use_dtls() const;
+    std::string dtls_peer_key(const endpoint_type& _peer) const;
+    bool send_queued_dtls_unlocked(const target_data_iterator_type _it);
+    void feed_dtls_unicast(const message_buffer_t& _unicast_recv_buffer, size_t _bytes);
+
     auto shared_ptr() { return std::shared_ptr<udp_server_endpoint_impl>(shared_from_this(), this); }
 
 private:
@@ -124,6 +131,9 @@ private:
     std::map<std::string, bool, std::less<>> join_status_;
 
     std::map<service_t, endpoint_type> default_targets_;
+
+    // One DTLS association per peer, keyed by "address:port".
+    std::map<std::string, std::shared_ptr<dtls_session>, std::less<>> dtls_sessions_;
 
     boost::asio::ip::address netmask_;
     uint16_t prefix_{0};

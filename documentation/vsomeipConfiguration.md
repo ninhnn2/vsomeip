@@ -25,6 +25,7 @@
     - [Security Policy Extensions](#security-policy-extensions)
   - [Tracing](#tracing)
   - [UDP Receive Buffer Size](#udp-receive-buffer-size)
+  - [DTLS](#dtls)
   - [Service Discovery](#service-discovery)
   - [nPDU Default Timings](#npdu-default-timings)
   - [Services](#services)
@@ -695,6 +696,34 @@ The general filter rules are:
 ## UDP Receive Buffer Size
 
 - **udp-receive-buffer-size** - Specifies the size of the socket receive buffer (SO_RCVBUF) used for UDP client and server endpoints in bytes. Requires CAP_NET_ADMIN to be successful. The default value is: `1703936`.
+
+
+## DTLS
+
+Optional DTLS 1.2 protection for UDP **unicast** service endpoints, using a pre-shared
+key. Multicast datagrams, including SOME/IP-SD, and TCP endpoints are not affected.
+Both peers need this object with the same identity and key. See
+[DTLS transport for UDP endpoints](dtls.md) for the design and its limitations.
+
+```json
+"dtls" : {
+    "enable" : true,
+    "psk-identity" : "lab-peer",
+    "psk-key-file" : "dtls.psk"
+}
+```
+
+- **enable** - Enables DTLS on UDP unicast service endpoints. The default value is `false`;
+  without the `dtls` object nothing changes.
+- **psk-identity** - PSK identity presented during the handshake. Required when enabled.
+- **psk-key** - The pre-shared key as a hexadecimal string, at least 16 bytes (32 hex
+  characters). Use `psk-key-file` instead of putting the key in the configuration.
+- **psk-key-file** - Path to a file whose first line holds the hexadecimal key. A relative
+  path is resolved against the directory of the configuration file. Keep the file readable
+  only by the application account, for example mode `0600`.
+
+An enabled but incomplete or unreadable configuration fails closed: the endpoints keep
+DTLS enabled and drop traffic instead of falling back to plaintext.
 
 
 ## Service Discovery
