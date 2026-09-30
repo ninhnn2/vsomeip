@@ -23,6 +23,12 @@ typedef struct bio_st BIO;
 
 namespace vsomeip_v3 {
 
+// DTLS record framing constants needed by the endpoints to recognise a peer that
+// starts a new handshake on an address/port that already has a session.
+constexpr std::size_t VSOMEIP_DTLS_RECORD_HEADER_SIZE = 13U;
+constexpr std::uint8_t VSOMEIP_DTLS_CONTENT_TYPE_HANDSHAKE = 0x16U;
+constexpr std::uint8_t VSOMEIP_DTLS_HANDSHAKE_CLIENT_HELLO = 0x01U;
+
 // One DTLS association for one UDP peer. The endpoints own datagram routing;
 // this class owns the OpenSSL handshake, record protection and retransmit timer.
 class dtls_session : public std::enable_shared_from_this<dtls_session> {

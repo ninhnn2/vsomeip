@@ -497,7 +497,9 @@ bool udp_server_endpoint_impl::send_queued_dtls_unlocked(const target_data_itera
         _it->second.is_sending_ = false;
     }
 
-    return false;
+    // Same contract as the plaintext path: true means a send is in flight, so the
+    // caller keeps is_sending_ set and waits for send_cbk() to drain the queue.
+    return its_queued;
 }
 
 void udp_server_endpoint_impl::get_configured_times_from_endpoint(service_t _service, method_t _method,
@@ -635,13 +637,22 @@ void udp_server_endpoint_impl::feed_dtls_unicast(const message_buffer_t& _unicas
     const endpoint_type its_peer = unicast_remote_;
     const std::string its_key = dtls_peer_key(its_peer);
 
+    // A peer that restarted sends a fresh ClientHello from the same address and port.
+    // An established session cannot consume it, so it has to be replaced - otherwise
+    // the new peer instance could never complete a handshake. Record layout: content
+    // type, version, epoch, sequence number, length (13 bytes), then the handshake
+    // message type.
+    const bool its_client_hello = _bytes > VSOMEIP_DTLS_RECORD_HEADER_SIZE
+            && _unicast_recv_buffer[0] == VSOMEIP_DTLS_CONTENT_TYPE_HANDSHAKE
+            && _unicast_recv_buffer[VSOMEIP_DTLS_RECORD_HEADER_SIZE] == VSOMEIP_DTLS_HANDSHAKE_CLIENT_HELLO;
+
     std::shared_ptr<dtls_session> its_session;
     {
         std::scoped_lock its_lock(sync_);
 
         auto its_found = dtls_sessions_.find(its_key);
         if (its_found != dtls_sessions_.end()) {
-            if (its_found->second->is_failed()) {
+            if (its_found->second->is_failed() || (its_client_hello && its_found->second->is_ready())) {
                 dtls_sessions_.erase(its_found);
             } else {
                 its_session = its_found->second;
