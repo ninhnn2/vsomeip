@@ -9,6 +9,9 @@ the SOME/IP parser.
 The configuration keys are documented under
 [DTLS](vsomeipConfiguration.md#dtls) in the configuration reference.
 
+Measured latency, throughput and CPU against a plaintext control, plus the test
+matrix, are in [dtls-benchmark.md](dtls-benchmark.md).
+
 ```json
 "dtls" : {
     "enable" : true,

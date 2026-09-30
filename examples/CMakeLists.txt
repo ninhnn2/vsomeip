@@ -26,10 +26,18 @@ target_link_libraries(subscribe-sample ${VSOMEIP_NAME} ${Boost_LIBRARIES} ${DL_L
 add_executable(notify-sample notify-sample.cpp ${EXAMPLE_CONFIG_FILES})
 target_link_libraries(notify-sample ${VSOMEIP_NAME} ${Boost_LIBRARIES} ${DL_LIBRARY})
 
-add_dependencies(examples request-sample response-sample subscribe-sample notify-sample)
+# DTLS benchmark: echo/sink service plus a driver that reports latency, throughput
+# and process CPU time for one payload size per run.
+add_executable(dtls-bench-service dtls-bench-service.cpp)
+target_link_libraries(dtls-bench-service ${VSOMEIP_NAME} ${Boost_LIBRARIES} ${DL_LIBRARY} ${CMAKE_THREAD_LIBS_INIT})
+
+add_executable(dtls-bench-client dtls-bench-client.cpp)
+target_link_libraries(dtls-bench-client ${VSOMEIP_NAME} ${Boost_LIBRARIES} ${DL_LIBRARY} ${CMAKE_THREAD_LIBS_INIT})
+
+add_dependencies(examples request-sample response-sample subscribe-sample notify-sample dtls-bench-service dtls-bench-client)
 
 install (
-    TARGETS request-sample response-sample subscribe-sample notify-sample
+    TARGETS request-sample response-sample subscribe-sample notify-sample dtls-bench-service dtls-bench-client
     RUNTIME DESTINATION "${INSTALL_BIN_DIR}" COMPONENT bin
 )
 
