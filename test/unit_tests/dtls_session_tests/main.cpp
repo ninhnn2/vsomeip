@@ -1,0 +1,11 @@
+// Copyright (C) 2014-2026 Bayerische Motoren Werke Aktiengesellschaft (BMW AG)
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+#include "common/test_main.hpp"
+
+int main(int argc, char** argv) {
+    // Run every case: a backend difference should show as a list, not stop at the first.
+    return test_main(argc, argv, std::chrono::seconds(0), false);
+}
