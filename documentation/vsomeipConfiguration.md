@@ -719,11 +719,89 @@ Both peers need this object with the same identity and key. See
 - **psk-key** - The pre-shared key as a hexadecimal string, at least 16 bytes (32 hex
   characters). Use `psk-key-file` instead of putting the key in the configuration.
 - **psk-key-file** - Path to a file whose first line holds the hexadecimal key. A relative
-  path is resolved against the directory of the configuration file. Keep the file readable
-  only by the application account, for example mode `0600`.
+  path is resolved against the directory of the configuration file. The file must not be
+  readable by group or others (mode `0600`); a looser file is refused.
+- **psk-key-command** - Shell command that prints the hexadecimal key on its first output
+  line. Used when neither `psk-key` nor `psk-key-file` is given, so the key never has to
+  be stored next to the configuration: the command can read it from a keyring, an HSM or
+  a trusted application. It runs once, while the configuration is loaded, in the working
+  directory of the process.
+- **cipher** - OpenSSL cipher string. The default `PSK-AES128-GCM-SHA256` has no forward
+  secrecy: whoever obtains the key can decrypt traffic recorded earlier.
+  `ECDHE-PSK-CHACHA20-POLY1305` adds an ephemeral key exchange and is the only AEAD
+  ECDHE-PSK suite OpenSSL provides. Both peers must use the same value.
+- **peers** - Optional list of per-peer credentials, so each pair of nodes holds its own
+  key and one compromised node does not expose the other links. Each entry has
+  `address` (the peer's unicast address, used to choose the credentials for outgoing
+  sessions), `identity`, and one of `key`, `key-file` or `key-command` with the same
+  meaning as above. An incoming session is matched by the identity the peer presents.
+  Entries take precedence over the node-wide `psk-identity`, which then becomes optional.
+
+```json
+"dtls" : {
+    "enable" : true,
+    "cipher" : "ECDHE-PSK-CHACHA20-POLY1305",
+    "peers" : [
+        {
+            "address" : "192.0.2.4",
+            "identity" : "pair-192_168_0_112-192_168_0_4",
+            "key-command" : "/usr/local/bin/dtls-key pair-192_0_2_112-192_0_2_4"
+        }
+    ]
+}
+```
 
 An enabled but incomplete or unreadable configuration fails closed: the endpoints keep
-DTLS enabled and drop traffic instead of falling back to plaintext.
+DTLS enabled and drop traffic instead of falling back to plaintext. The same holds for a
+peer that presents an unknown identity, a different key, or a cipher this node does not
+accept: its handshake fails and no data is delivered.
+
+### Certificate mode
+
+With `"mode": "certificate"` the peers authenticate with X.509 certificates instead of a
+pre-shared key: each node holds its own private key, and a peer is accepted when its chain
+ends in the configured CA **and** its certificate carries the name configured for its
+address. See [DTLS with X.509 certificates](dtls-certificate.md) for the design.
+
+```json
+"dtls" : {
+    "enable" : true,
+    "mode" : "certificate",
+    "certificate" : "pki/node.crt",
+    "private-key" : "pki/node.key",
+    "ca" : "pki/ca.crt",
+    "time-floor" : "2026-10-01",
+    "peers" : [
+        { "address" : "192.0.2.112", "name" : "host.ecu.lab" }
+    ]
+}
+```
+
+- **mode** - `psk` (default) or `certificate`. Both peers must use the same mode.
+- **certificate** - PEM file with this node's certificate followed by the intermediate CA
+  certificates, so the peer can build the chain. Relative paths are resolved against the
+  directory of the configuration file.
+- **private-key** - PEM file with the private key of `certificate`, mode `0600` (a looser
+  file is refused), or an OpenSSL store URI such as `pkcs11:token=ecu;object=dtls`. A URI
+  is handed to OpenSSL unchanged, so a key held in an HSM is used through the PKCS#11
+  provider without leaving it. Store URIs need the OpenSSL backend; the wolfSSL backend
+  accepts a PEM file (optionally as `file:<path>`) and refuses any other URI.
+- **ca** - PEM file with the trust anchors. Only its integrity matters; protect it like
+  the binaries (read-only, verified rootfs).
+- **cipher** - Defaults to `ECDHE-ECDSA-AES128-GCM-SHA256`: forward secrecy, ECDSA
+  authentication and hardware-accelerated AES-GCM.
+- **peers** - Required. Each entry has `address` (unicast address of the peer) and `name`
+  (DNS name its certificate must carry in subjectAltName; the subject CN is not used).
+  A peer whose address is not listed is refused: a valid chain alone only proves that the
+  peer belongs to the CA, not that it is the expected ECU.
+- **time-floor** - Date `YYYY-MM-DD`, normally the firmware release date. While the system
+  clock is earlier, the clock is treated as unset: certificate expiry is checked against
+  this date and not-before is not checked. Defaults to 2026-10-01.
+
+Certificates must have `extendedKeyUsage` `serverAuth` and `clientAuth`, because a node is
+the DTLS server for the services it offers and the client for the ones it uses. The server
+answers a ClientHello with a stateless cookie first (RFC 6347 4.2.1), so a spoofed sender
+cannot make it send its certificate flight to a victim.
 
 
 ## Service Discovery

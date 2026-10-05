@@ -661,8 +661,32 @@ void udp_server_endpoint_impl::feed_dtls_unicast(const message_buffer_t& _unicas
 
         if (!its_session && unicast_socket_ && unicast_socket_->is_open()) {
             auto its_weak_self = std::weak_ptr<udp_server_endpoint_impl>(shared_ptr());
+            // Server side: the key is only known once the client names its
+            // identity, so hand the session a resolver instead of one key.
+            dtls_session::credentials its_credentials;
+            its_credentials.cipher_ = configuration_->get_dtls_cipher();
+            if (configuration_->is_dtls_certificate_mode()) {
+                // The client is known by its address before any certificate is
+                // seen, so the name it must prove is fixed up front.
+                const std::string its_remote = its_peer.address().to_string();
+                its_credentials.auth_ = dtls_auth_e::CERTIFICATE;
+                its_credentials.certificate_ = configuration_->get_dtls_certificate();
+                its_credentials.private_key_ = configuration_->get_dtls_private_key();
+                its_credentials.ca_ = configuration_->get_dtls_ca();
+                if (configuration_->get_dtls_time_floor() > 0) {
+                    its_credentials.time_floor_ = configuration_->get_dtls_time_floor();
+                }
+                its_credentials.peer_name_ = configuration_->get_dtls_peer_name(its_remote);
+                its_credentials.peer_address_ = its_remote + ":" + std::to_string(its_peer.port());
+            } else {
+                auto its_weak_configuration = std::weak_ptr<configuration>(configuration_);
+                its_credentials.resolver_ = [its_weak_configuration](const std::string& _identity) {
+                    auto its_configuration = its_weak_configuration.lock();
+                    return its_configuration ? its_configuration->get_dtls_psk_for_identity(_identity) : std::string{};
+                };
+            }
             its_session = dtls_session::create(
-                    io_, false, configuration_->get_dtls_psk_identity(), configuration_->get_dtls_psk(),
+                    io_, false, std::move(its_credentials),
                     [its_weak_self, its_peer](dtls_session::datagram_t _data, dtls_session::send_completion_t _completion) {
                         // Post: write() can be called with sync_ held, and the send needs it.
                         auto its_self = its_weak_self.lock();
@@ -675,7 +699,7 @@ void udp_server_endpoint_impl::feed_dtls_unicast(const message_buffer_t& _unicas
                         auto its_payload = std::make_shared<dtls_session::datagram_t>(std::move(_data));
                         boost::asio::post(its_self->io_, [its_self, its_peer, its_payload,
                                                           _completion = std::move(_completion)]() mutable {
-                            std::scoped_lock its_lock(its_self->sync_);
+                            std::scoped_lock its_self_lock(its_self->sync_);
                             if (!its_self->unicast_socket_ || !its_self->unicast_socket_->is_open()) {
                                 if (_completion) {
                                     _completion(false);

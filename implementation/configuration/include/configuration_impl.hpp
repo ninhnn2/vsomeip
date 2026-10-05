@@ -248,6 +248,16 @@ public:
     VSOMEIP_EXPORT bool is_dtls_enabled() const override;
     VSOMEIP_EXPORT const std::string& get_dtls_psk_identity() const override;
     VSOMEIP_EXPORT const std::string& get_dtls_psk() const override;
+    VSOMEIP_EXPORT const std::string& get_dtls_cipher() const override;
+    VSOMEIP_EXPORT bool get_dtls_peer_credentials(const std::string& _address, std::string& _identity,
+                                                  std::string& _psk) const override;
+    VSOMEIP_EXPORT std::string get_dtls_psk_for_identity(const std::string& _identity) const override;
+    VSOMEIP_EXPORT bool is_dtls_certificate_mode() const override;
+    VSOMEIP_EXPORT const std::string& get_dtls_certificate() const override;
+    VSOMEIP_EXPORT const std::string& get_dtls_private_key() const override;
+    VSOMEIP_EXPORT const std::string& get_dtls_ca() const override;
+    VSOMEIP_EXPORT std::string get_dtls_peer_name(const std::string& _address) const override;
+    VSOMEIP_EXPORT std::int64_t get_dtls_time_floor() const override;
 
     VSOMEIP_EXPORT bool is_tp_client(service_t _service, instance_t _instance, method_t _method) const;
     VSOMEIP_EXPORT bool is_tp_service(service_t _service, instance_t _instance, method_t _method) const;
@@ -368,6 +378,12 @@ private:
     void load_activation_file_path(std::set<std::string>& _path, const boost::property_tree::ptree& _tree);
     void load_udp_receive_buffer_size(const configuration_element& _element);
     void load_dtls(const configuration_element& _element);
+    // Reads a key from "key", "key-file" or "key-command", in that order. The
+    // command form keeps the key out of the file system: it can come from a
+    // keyring, an HSM or an OP-TEE helper that prints it on stdout.
+    static std::string load_dtls_key(const boost::property_tree::ptree& _tree, const std::string& _config_path,
+                                     const std::string& _prefix);
+    bool load_dtls_certificate(const boost::property_tree::ptree& _settings, const std::string& _config_path);
     bool load_npdu_debounce_times_configuration(const std::shared_ptr<service>& _service, const boost::property_tree::ptree& _tree);
     bool load_npdu_debounce_times_for_service(const std::shared_ptr<service>& _service, bool _is_request,
                                               const boost::property_tree::ptree& _tree);
@@ -634,6 +650,23 @@ protected:
     bool dtls_enabled_{false};
     std::string dtls_psk_identity_;
     std::string dtls_psk_;
+    std::string dtls_cipher_;
+    // Per-peer keys: address -> (identity, key) for outgoing sessions, and
+    // identity -> key for incoming ones. One compromised ECU then only exposes
+    // the links it is part of.
+    struct dtls_peer_t {
+        std::string identity_;
+        std::string psk_;
+    };
+    std::map<std::string, dtls_peer_t> dtls_peers_by_address_;
+    std::map<std::string, std::string> dtls_psk_by_identity_;
+    // Certificate mode: own credentials and the name expected per peer address.
+    bool dtls_certificate_mode_{false};
+    std::string dtls_certificate_;
+    std::string dtls_private_key_;
+    std::string dtls_ca_;
+    std::map<std::string, std::string> dtls_name_by_address_;
+    std::int64_t dtls_time_floor_{0};
 
     routing_state_e initial_routing_state_;
 

@@ -3,10 +3,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+#include <atomic>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include <vsomeip/vsomeip.hpp>
@@ -16,10 +19,15 @@
 // Echo / sink service for the DTLS benchmark. It keeps no per-request state, so
 // the CPU time it reports on exit is the cost of receiving, dispatching and
 // answering the traffic the client generated.
+//
+//   --name N        vsomeip application name (default bench-service)
+//   --progress-s P  print a SERVICE_PROGRESS line every P seconds while traffic
+//                   is arriving (default 1, 0 turns it off)
 class bench_service {
 public:
-    explicit bench_service(std::string _name) :
-        name_(std::move(_name)), app_(vsomeip::runtime::get()->create_application(name_)) { }
+    bench_service(std::string _name, std::uint32_t _progress_s) :
+        name_(std::move(_name)), progress_s_(_progress_s),
+        app_(vsomeip::runtime::get()->create_application(name_)) { }
 
     bool init() {
         if (!app_->init()) {
@@ -43,9 +51,16 @@ public:
         return true;
     }
 
-    void start() { app_->start(); }
+    void start() {
+        if (progress_s_ != 0) {
+            progress_ = std::thread([this]() { watch(); });
+        }
+        app_->start();
+        stop_progress();
+    }
 
     void stop() {
+        stop_progress();
         report();
         app_->clear_all_handler();
         app_->stop_offer_service(BENCH_SERVICE_ID, BENCH_INSTANCE_ID);
@@ -64,6 +79,33 @@ public:
     }
 
 private:
+    // Only prints when something arrived, so an idle service stays quiet.
+    void watch() {
+        std::uint64_t its_last = 0;
+        while (!stopping_) {
+            for (std::uint32_t i = 0; i < progress_s_ * 10U && !stopping_; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            const std::uint64_t its_requests = requests_;
+            if (stopping_ || its_requests == its_last) {
+                continue;
+            }
+            std::printf("SERVICE_PROGRESS requests=%llu bytes_in=%llu bytes_out=%llu last_%us=%llu\n",
+                        static_cast<unsigned long long>(its_requests), static_cast<unsigned long long>(bytes_in_),
+                        static_cast<unsigned long long>(bytes_out_), progress_s_,
+                        static_cast<unsigned long long>(its_requests - its_last));
+            std::fflush(stdout);
+            its_last = its_requests;
+        }
+    }
+
+    void stop_progress() {
+        stopping_ = true;
+        if (progress_.joinable()) {
+            progress_.join();
+        }
+    }
+
     void on_echo(const std::shared_ptr<vsomeip::message>& _request) {
         auto its_payload = _request->get_payload();
         const std::size_t its_size = its_payload ? its_payload->get_length() : 0U;
@@ -92,12 +134,15 @@ private:
     }
 
     std::string name_;
+    std::uint32_t progress_s_{1};
     std::shared_ptr<vsomeip::application> app_;
     // 8 byte acknowledgement (parentheses: a braced list would build two elements).
     std::vector<vsomeip::byte_t> ack_ = std::vector<vsomeip::byte_t>(8, 0xAB);
     std::uint64_t requests_{0};
     std::uint64_t bytes_in_{0};
     std::uint64_t bytes_out_{0};
+    std::atomic<bool> stopping_{false};
+    std::thread progress_;
     bench::clock_t_::time_point wall_start_{};
     double cpu_start_{0.0};
 };
@@ -112,13 +157,16 @@ static void handle_signal(int) {
 
 int main(int argc, char** argv) {
     std::string its_name{"bench-service"};
+    std::uint32_t its_progress_s{1};
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--name") == 0 && i + 1 < argc) {
             its_name = argv[++i];
+        } else if (std::strcmp(argv[i], "--progress-s") == 0 && i + 1 < argc) {
+            its_progress_s = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         }
     }
 
-    bench_service its_service(its_name);
+    bench_service its_service(its_name, its_progress_s);
     g_service = &its_service;
 
     std::signal(SIGINT, handle_signal);

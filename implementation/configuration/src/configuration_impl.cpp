@@ -4,11 +4,14 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 #include <cctype>
+#include <cstdio>
 #include <fstream>
 #include <functional>
 #include <limits>
 #include <mutex>
 #include <set>
+#include <ctime>
+#include <iomanip>
 #include <sstream>
 #include <utility>
 
@@ -31,6 +34,8 @@
 #include "logger_ext.hpp"
 #include "../include/client.hpp"
 #include "../include/configuration_impl.hpp"
+
+#include "../../endpoints/include/dtls_session.hpp"
 #include "../include/event.hpp"
 #include "../include/eventgroup.hpp"
 #include "../include/service.hpp"
@@ -4357,65 +4362,6 @@ void configuration_impl::load_someip_tp_for_service(const std::shared_ptr<servic
     }
 }
 
-void configuration_impl::load_dtls(const configuration_element& _element) {
-    const auto its_settings = _element.tree_.get_child_optional("dtls");
-    if (!its_settings) {
-        return;
-    }
-
-    // A present but malformed DTLS object is treated as enabled, so that bad
-    // credentials fail closed in the endpoint instead of silently downgrading
-    // the traffic to plaintext.
-    dtls_enabled_ = true;
-    try {
-        const bool its_enabled = its_settings->get<bool>("enable", false);
-        dtls_enabled_ = its_enabled;
-
-        const std::string its_identity = its_settings->get<std::string>("psk-identity", "");
-        std::string its_key = its_settings->get<std::string>("psk-key", "");
-        const std::string its_key_file = its_settings->get<std::string>("psk-key-file", "");
-
-        if (!its_key_file.empty()) {
-            boost::filesystem::path its_resolved_key_file(its_key_file);
-            if (its_resolved_key_file.is_relative()) {
-                its_resolved_key_file =
-                        boost::filesystem::path(_element.name_).parent_path() / its_resolved_key_file;
-            }
-
-            std::ifstream its_input(its_resolved_key_file.string());
-            if (!its_input) {
-                VSOMEIP_ERROR << "DTLS PSK file could not be read: " << its_resolved_key_file.string();
-                dtls_psk_identity_.clear();
-                dtls_psk_.clear();
-                return;
-            }
-
-            std::getline(its_input, its_key);
-            trim(its_key);
-        }
-
-        if (its_enabled && (its_identity.empty() || its_key.size() < 32U || (its_key.size() % 2U) != 0U)) {
-            VSOMEIP_ERROR << "DTLS configuration requires psk-identity and a hexadecimal "
-                             "psk-key of at least 16 bytes";
-            dtls_psk_identity_.clear();
-            dtls_psk_.clear();
-            return;
-        }
-
-        dtls_psk_identity_ = its_identity;
-        dtls_psk_ = its_key;
-
-        if (dtls_enabled_) {
-            VSOMEIP_WARNING << "DTLS PSK is enabled for UDP unicast service endpoints; "
-                               "keep the key file private";
-        }
-    } catch (const std::exception& e) {
-        VSOMEIP_ERROR << "Invalid DTLS configuration: " << e.what();
-        dtls_psk_identity_.clear();
-        dtls_psk_.clear();
-    }
-}
-
 void configuration_impl::load_udp_receive_buffer_size(const configuration_element& _element) {
     const std::string its_buffer_size("udp-receive-buffer-size");
     try {
@@ -4435,6 +4381,290 @@ void configuration_impl::load_udp_receive_buffer_size(const configuration_elemen
     } catch (...) {
         // intentionally left empty
     }
+}
+
+std::string configuration_impl::load_dtls_key(const boost::property_tree::ptree& _tree, const std::string& _config_path,
+                                             const std::string& _prefix) {
+    std::string its_key = _tree.get<std::string>(_prefix + "key", "");
+    if (!its_key.empty()) {
+        return its_key;
+    }
+
+    const std::string its_file = _tree.get<std::string>(_prefix + "key-file", "");
+    if (!its_file.empty()) {
+        boost::filesystem::path its_path(its_file);
+        if (its_path.is_relative()) {
+            its_path = boost::filesystem::path(_config_path).parent_path() / its_path;
+        }
+        std::ifstream its_input(its_path.string());
+        if (!its_input) {
+            VSOMEIP_ERROR << "DTLS PSK file could not be read: " << its_path.string();
+            return {};
+        }
+        // A key readable by everyone is not a key. Refuse it instead of starting
+        // an encrypted link that anyone on the box can impersonate.
+        boost::system::error_code its_error;
+        const auto its_permissions = boost::filesystem::status(its_path, its_error).permissions();
+        if (!its_error && (its_permissions & (boost::filesystem::group_read | boost::filesystem::others_read)) != 0) {
+            VSOMEIP_ERROR << "DTLS PSK file is readable by group or others, refusing it: " << its_path.string();
+            return {};
+        }
+        std::getline(its_input, its_key);
+        boost::trim(its_key);
+        return its_key;
+    }
+
+    // Last resort, and the only form that keeps the key off the file system: the
+    // command prints the hexadecimal key on stdout. It is what a keyring, an HSM
+    // or an OP-TEE client application is wired in through.
+    const std::string its_command = _tree.get<std::string>(_prefix + "key-command", "");
+    if (its_command.empty()) {
+        return {};
+    }
+    std::unique_ptr<FILE, int (*)(FILE*)> its_pipe(popen(its_command.c_str(), "r"), &pclose);
+    if (!its_pipe) {
+        VSOMEIP_ERROR << "DTLS PSK command could not be started";
+        return {};
+    }
+    char its_buffer[256] = {0};
+    if (std::fgets(its_buffer, sizeof(its_buffer), its_pipe.get())) {
+        its_key = its_buffer;
+        boost::trim(its_key);
+    }
+    std::fill(std::begin(its_buffer), std::end(its_buffer), '\0');
+    if (its_key.empty()) {
+        VSOMEIP_ERROR << "DTLS PSK command returned nothing";
+    }
+    return its_key;
+}
+
+void configuration_impl::load_dtls(const configuration_element& _element) {
+    const auto settings = _element.tree_.get_child_optional("dtls");
+    if (!settings) return;
+    // Treat a present but malformed DTLS object as enabled so that bad
+    // credentials fail closed in the endpoint instead of downgrading traffic.
+    dtls_enabled_ = true;
+    const auto its_fail = [this]() {
+        dtls_enabled_ = true;
+        dtls_psk_identity_.clear();
+        dtls_psk_.clear();
+        dtls_peers_by_address_.clear();
+        dtls_psk_by_identity_.clear();
+        dtls_certificate_mode_ = false;
+        dtls_certificate_.clear();
+        dtls_private_key_.clear();
+        dtls_ca_.clear();
+        dtls_name_by_address_.clear();
+    };
+    const auto is_valid_key = [](const std::string& _key) { return _key.size() >= 32U && (_key.size() % 2U) == 0U; };
+
+    try {
+        const bool enabled = settings->get<bool>("enable", false);
+        const std::string its_mode = settings->get<std::string>("mode", "psk");
+        if (its_mode == "certificate") {
+            dtls_cipher_ = settings->get<std::string>("cipher", VSOMEIP_DTLS_DEFAULT_CERT_CIPHER);
+            if (!load_dtls_certificate(*settings, _element.name_)) {
+                its_fail();
+                dtls_certificate_mode_ = true;  // stay in certificate mode, with nothing usable
+                return;
+            }
+            dtls_enabled_ = enabled;
+            if (dtls_enabled_) {
+                VSOMEIP_WARNING << "DTLS enabled for UDP unicast service endpoints, certificate mode, cipher "
+                                << dtls_cipher_ << ", " << dtls_name_by_address_.size() << " peer(s) allowed";
+            }
+            return;
+        }
+        if (its_mode != "psk") {
+            VSOMEIP_ERROR << "DTLS mode must be \"psk\" or \"certificate\", got \"" << its_mode << "\"";
+            its_fail();
+            return;
+        }
+        dtls_cipher_ = settings->get<std::string>("cipher", VSOMEIP_DTLS_DEFAULT_CIPHER);
+        const std::string identity = settings->get<std::string>("psk-identity", "");
+        const std::string key = load_dtls_key(*settings, _element.name_, "psk-");
+
+        // Optional per-peer keys. An entry wins over the node-wide key for that
+        // address, so a deployment can migrate one link at a time.
+        dtls_peers_by_address_.clear();
+        dtls_psk_by_identity_.clear();
+        const auto its_peers = settings->get_child_optional("peers");
+        if (its_peers) {
+            for (const auto& its_entry : *its_peers) {
+                const std::string its_address = its_entry.second.get<std::string>("address", "");
+                const std::string its_identity = its_entry.second.get<std::string>("identity", "");
+                const std::string its_key = load_dtls_key(its_entry.second, _element.name_, "");
+                if (its_identity.empty() || !is_valid_key(its_key)) {
+                    VSOMEIP_ERROR << "DTLS peer entry needs an identity and a hexadecimal key of at least 16 bytes";
+                    its_fail();
+                    return;
+                }
+                if (!its_address.empty()) {
+                    dtls_peers_by_address_[its_address] = dtls_peer_t{its_identity, its_key};
+                }
+                dtls_psk_by_identity_[its_identity] = its_key;
+            }
+        }
+
+        const bool its_node_key_ok = !identity.empty() && is_valid_key(key);
+        if (enabled && !its_node_key_ok && dtls_psk_by_identity_.empty()) {
+            VSOMEIP_ERROR << "DTLS configuration requires psk-identity and a hexadecimal psk-key of at least 16 bytes";
+            its_fail();
+            return;
+        }
+
+        dtls_enabled_ = enabled;
+        dtls_psk_identity_ = its_node_key_ok ? identity : "";
+        dtls_psk_ = its_node_key_ok ? key : "";
+        if (its_node_key_ok) {
+            dtls_psk_by_identity_.emplace(identity, key);
+        }
+        if (dtls_enabled_) {
+            VSOMEIP_WARNING << "DTLS PSK is enabled for UDP unicast service endpoints; keep the key file private";
+            if (dtls_cipher_.find("ECDHE") == std::string::npos) {
+                VSOMEIP_WARNING << "DTLS cipher " << dtls_cipher_
+                                << " has no forward secrecy: a leaked key decrypts previously recorded traffic";
+            }
+            if (!dtls_peers_by_address_.empty()) {
+                VSOMEIP_INFO << "DTLS: " << dtls_peers_by_address_.size() << " per-peer key(s) configured";
+            }
+        }
+    } catch (const std::exception& error) {
+        VSOMEIP_ERROR << "Invalid DTLS configuration: " << error.what();
+        its_fail();
+    }
+}
+
+bool configuration_impl::load_dtls_certificate(const boost::property_tree::ptree& _settings, const std::string& _config_path) {
+    const auto resolve = [&_config_path](const std::string& _path) {
+        boost::filesystem::path its_path(_path);
+        if (its_path.is_relative()) {
+            its_path = boost::filesystem::path(_config_path).parent_path() / its_path;
+        }
+        return its_path.string();
+    };
+    const auto exists = [](const std::string& _path, const char* _what) {
+        boost::system::error_code its_error;
+        if (!boost::filesystem::is_regular_file(_path, its_error)) {
+            VSOMEIP_ERROR << "DTLS " << _what << " not found: " << _path;
+            return false;
+        }
+        return true;
+    };
+
+    const std::string its_certificate = _settings.get<std::string>("certificate", "");
+    const std::string its_key = _settings.get<std::string>("private-key", "");
+    const std::string its_ca = _settings.get<std::string>("ca", "");
+    if (its_certificate.empty() || its_key.empty() || its_ca.empty()) {
+        VSOMEIP_ERROR << "DTLS certificate mode requires \"certificate\", \"private-key\" and \"ca\"";
+        return false;
+    }
+    dtls_certificate_ = resolve(its_certificate);
+    dtls_ca_ = resolve(its_ca);
+    if (!exists(dtls_certificate_, "certificate") || !exists(dtls_ca_, "CA")) {
+        return false;
+    }
+
+    // "scheme:..." (pkcs11:, file:, ...) is an OSSL_STORE URI handed to OpenSSL
+    // unchanged; anything else is a PEM file, which must be private to its owner.
+    const bool its_is_uri = its_key.find(':') != std::string::npos && its_key.find('/') > its_key.find(':');
+    if (its_is_uri) {
+        dtls_private_key_ = its_key;
+    } else {
+        dtls_private_key_ = resolve(its_key);
+        if (!exists(dtls_private_key_, "private key")) {
+            return false;
+        }
+        boost::system::error_code its_error;
+        const auto its_permissions = boost::filesystem::status(dtls_private_key_, its_error).permissions();
+        if (!its_error && (its_permissions & (boost::filesystem::group_read | boost::filesystem::others_read)) != 0) {
+            VSOMEIP_ERROR << "DTLS private key is readable by group or others, refusing it: " << dtls_private_key_;
+            return false;
+        }
+    }
+
+    // "time-floor": "YYYY-MM-DD", typically the firmware release date. Below it
+    // the clock is treated as unset (see VSOMEIP_DTLS_DEFAULT_TIME_FLOOR).
+    dtls_time_floor_ = 0;
+    const std::string its_floor = _settings.get<std::string>("time-floor", "");
+    if (!its_floor.empty()) {
+        std::tm its_tm{};
+        std::istringstream its_input(its_floor);
+        its_input >> std::get_time(&its_tm, "%Y-%m-%d");
+        if (its_input.fail()) {
+            VSOMEIP_ERROR << "DTLS time-floor must be YYYY-MM-DD, got \"" << its_floor << "\"";
+            return false;
+        }
+        dtls_time_floor_ = static_cast<std::int64_t>(timegm(&its_tm));
+    }
+
+    // Every peer must be named. A peer missing from this list is refused rather
+    // than accepted on "valid chain" alone.
+    dtls_name_by_address_.clear();
+    const auto its_peers = _settings.get_child_optional("peers");
+    if (its_peers) {
+        for (const auto& its_entry : *its_peers) {
+            const std::string its_address = its_entry.second.get<std::string>("address", "");
+            const std::string its_name = its_entry.second.get<std::string>("name", "");
+            if (its_address.empty() || its_name.empty()) {
+                VSOMEIP_ERROR << "DTLS certificate peer entry needs an \"address\" and a \"name\"";
+                return false;
+            }
+            dtls_name_by_address_[its_address] = its_name;
+        }
+    }
+    if (dtls_name_by_address_.empty()) {
+        VSOMEIP_ERROR << "DTLS certificate mode needs at least one entry in \"peers\"";
+        return false;
+    }
+    dtls_certificate_mode_ = true;
+    return true;
+}
+
+bool configuration_impl::is_dtls_certificate_mode() const {
+    return dtls_certificate_mode_;
+}
+
+const std::string& configuration_impl::get_dtls_certificate() const {
+    return dtls_certificate_;
+}
+
+const std::string& configuration_impl::get_dtls_private_key() const {
+    return dtls_private_key_;
+}
+
+const std::string& configuration_impl::get_dtls_ca() const {
+    return dtls_ca_;
+}
+
+std::int64_t configuration_impl::get_dtls_time_floor() const {
+    return dtls_time_floor_;
+}
+
+std::string configuration_impl::get_dtls_peer_name(const std::string& _address) const {
+    const auto its_found = dtls_name_by_address_.find(_address);
+    return its_found != dtls_name_by_address_.end() ? its_found->second : std::string{};
+}
+
+const std::string& configuration_impl::get_dtls_cipher() const {
+    return dtls_cipher_;
+}
+
+bool configuration_impl::get_dtls_peer_credentials(const std::string& _address, std::string& _identity, std::string& _psk) const {
+    const auto its_found = dtls_peers_by_address_.find(_address);
+    if (its_found != dtls_peers_by_address_.end()) {
+        _identity = its_found->second.identity_;
+        _psk = its_found->second.psk_;
+        return true;
+    }
+    _identity = dtls_psk_identity_;
+    _psk = dtls_psk_;
+    return !_identity.empty() && !_psk.empty();
+}
+
+std::string configuration_impl::get_dtls_psk_for_identity(const std::string& _identity) const {
+    const auto its_found = dtls_psk_by_identity_.find(_identity);
+    return its_found != dtls_psk_by_identity_.end() ? its_found->second : std::string{};
 }
 
 void configuration_impl::load_secure_services(const configuration_element& _element) {

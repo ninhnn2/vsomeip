@@ -32,7 +32,8 @@ udp_client_endpoint_impl::udp_client_endpoint_impl(const std::shared_ptr<boardne
     udp_client_endpoint_base_impl(_boardnet_endpoint_host, _routing_host, _local, _remote, _io, _configuration),
     remote_address_(_remote.address()), remote_port_(_remote.port()),
     udp_receive_buffer_size_(_configuration->get_udp_receive_buffer_size()),
-    tp_reassembler_(std::make_shared<tp::tp_reassembler>(_configuration->get_max_message_size_unreliable(), _io)) {
+    tp_reassembler_(std::make_shared<tp::tp_reassembler>(_configuration->get_max_message_size_unreliable(), _io)),
+    dtls_backoff_timer_(_io) {
     is_supporting_someip_tp_ = true;
 
     this->max_message_size_ = VSOMEIP_MAX_UDP_MESSAGE_SIZE;
@@ -41,6 +42,8 @@ udp_client_endpoint_impl::udp_client_endpoint_impl(const std::shared_ptr<boardne
 
 udp_client_endpoint_impl::~udp_client_endpoint_impl() {
     tp_reassembler_->stop();
+    boost::system::error_code its_error;
+    dtls_backoff_timer_.cancel(its_error);
 }
 
 bool udp_client_endpoint_impl::is_local() const {
@@ -174,8 +177,28 @@ void udp_client_endpoint_impl::connect_cbk(const boost::system::error_code& _err
     auto self = std::dynamic_pointer_cast<udp_client_endpoint_impl>(shared_from_this());
     std::weak_ptr<udp_client_endpoint_impl> its_weak_self(self);
 
+    // Client side: pick the key configured for this peer, so each link can hold
+    // its own credentials instead of one key shared by the whole network.
+    dtls_session::credentials its_credentials;
+    its_credentials.cipher_ = configuration_->get_dtls_cipher();
+    const std::string its_remote = remote_.address().to_string();
+    if (configuration_->is_dtls_certificate_mode()) {
+        its_credentials.auth_ = dtls_auth_e::CERTIFICATE;
+        its_credentials.certificate_ = configuration_->get_dtls_certificate();
+        its_credentials.private_key_ = configuration_->get_dtls_private_key();
+        its_credentials.ca_ = configuration_->get_dtls_ca();
+        if (configuration_->get_dtls_time_floor() > 0) {
+            its_credentials.time_floor_ = configuration_->get_dtls_time_floor();
+        }
+        its_credentials.peer_name_ = configuration_->get_dtls_peer_name(its_remote);
+        its_credentials.peer_address_ = its_remote;
+    } else if (!configuration_->get_dtls_peer_credentials(its_remote, its_credentials.identity_, its_credentials.psk_hex_)) {
+        VSOMEIP_ERROR << "DTLS: no key configured for peer " << its_remote;
+        return;
+    }
+
     dtls_session_ = dtls_session::create(
-            io_, true, configuration_->get_dtls_psk_identity(), configuration_->get_dtls_psk(),
+            io_, true, std::move(its_credentials),
             [its_weak_self](dtls_session::datagram_t _data, dtls_session::send_completion_t _completion) {
                 auto its_endpoint = its_weak_self.lock();
                 if (!its_endpoint) {
@@ -416,10 +439,27 @@ void udp_client_endpoint_impl::handle_dtls_datagram(boost::system::error_code co
     if (!_error && _bytes > 0) {
         dtls_session_->feed(_recv_buffer->data(), _bytes);
         if (dtls_session_->is_failed()) {
-            VSOMEIP_WARNING_P << "DTLS: session failed, reconnecting. remote: " << get_address_port_remote();
+            // 100 ms, 200 ms, ... capped at 30 s.
+            const auto its_shift = std::min<std::uint32_t>(dtls_failures_, 9U);
+            const auto its_delay = std::min(std::chrono::milliseconds(100U << its_shift), std::chrono::milliseconds(30000));
+            ++dtls_failures_;
+            VSOMEIP_WARNING_P << "DTLS: session failed (attempt " << dtls_failures_ << "), reconnecting in "
+                              << its_delay.count() << " ms. remote: " << get_address_port_remote();
             notify_disconnect();
-            restart(true);
+            dtls_session_.reset();  // drop anything else from this peer until the retry
+            auto its_weak_self = std::weak_ptr<udp_client_endpoint_impl>(
+                    std::dynamic_pointer_cast<udp_client_endpoint_impl>(shared_from_this()));
+            dtls_backoff_timer_.expires_after(its_delay);
+            dtls_backoff_timer_.async_wait(boost::asio::bind_executor(strand_, [its_weak_self](const boost::system::error_code& _timer_error) {
+                auto its_self = its_weak_self.lock();
+                if (!_timer_error && its_self) {
+                    its_self->restart(true);
+                }
+            }));
             return;
+        }
+        if (dtls_session_->is_ready()) {
+            dtls_failures_ = 0;
         }
         resume_dtls_queue();
     }

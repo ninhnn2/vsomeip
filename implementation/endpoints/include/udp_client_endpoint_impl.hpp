@@ -77,6 +77,11 @@ private:
     const int udp_receive_buffer_size_;
     std::shared_ptr<tp::tp_reassembler> tp_reassembler_;
     std::shared_ptr<dtls_session> dtls_session_;
+    // A rejected handshake (wrong key, untrusted certificate) does not fix
+    // itself; retrying at once floods both logs and the peer. Back off
+    // exponentially, starting over after the next successful handshake.
+    boost::asio::steady_timer dtls_backoff_timer_;
+    std::uint32_t dtls_failures_{0};
     std::chrono::steady_clock::time_point last_sent_;
 };
 

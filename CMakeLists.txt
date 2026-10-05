@@ -202,7 +202,23 @@ find_package(Threads REQUIRED)
 
 # Boost
 find_package( Boost 1.75 COMPONENTS filesystem REQUIRED )
-find_package(OpenSSL REQUIRED)
+# DTLS backend: OpenSSL (default) or wolfSSL. Exactly one is linked; the
+# endpoints only see dtls_session, whose source is chosen here.
+set(VSOMEIP_DTLS_BACKEND "openssl" CACHE STRING "TLS library for DTLS: openssl or wolfssl")
+set_property(CACHE VSOMEIP_DTLS_BACKEND PROPERTY STRINGS openssl wolfssl)
+if (VSOMEIP_DTLS_BACKEND STREQUAL "wolfssl")
+    # wolfSSL is GPLv3 or commercial; see documentation/dtls.md before shipping.
+    find_package(wolfssl CONFIG REQUIRED)
+    set(VSOMEIP_DTLS_LIBRARIES wolfssl::wolfssl)
+    set(VSOMEIP_DTLS_DEFINITIONS VSOMEIP_DTLS_BACKEND_WOLFSSL)
+elseif (VSOMEIP_DTLS_BACKEND STREQUAL "openssl")
+    find_package(OpenSSL REQUIRED)
+    set(VSOMEIP_DTLS_LIBRARIES OpenSSL::SSL OpenSSL::Crypto)
+    set(VSOMEIP_DTLS_DEFINITIONS)
+else ()
+    message(FATAL_ERROR "VSOMEIP_DTLS_BACKEND must be openssl or wolfssl, not ${VSOMEIP_DTLS_BACKEND}")
+endif ()
+message(STATUS "DTLS backend: ${VSOMEIP_DTLS_BACKEND}")
 if(${CMAKE_SYSTEM_NAME} MATCHES "QNX")
     include_directories(${Boost_INCLUDE_DIR} )
 else()
@@ -387,12 +403,19 @@ if (WIN32)
 list(FILTER ${VSOMEIP_NAME}_SRC EXCLUDE REGEX ".*uds.*")
 endif()
 
+if (VSOMEIP_DTLS_BACKEND STREQUAL "wolfssl")
+    list(FILTER ${VSOMEIP_NAME}_SRC EXCLUDE REGEX ".*/dtls_session\\.cpp$")
+else ()
+    list(FILTER ${VSOMEIP_NAME}_SRC EXCLUDE REGEX ".*/dtls_session_wolfssl\\.cpp$")
+endif ()
+
 list(SORT ${VSOMEIP_NAME}_SRC)
 
 # internal object library, all symbols exposed, used for testing
 add_library(${VSOMEIP_NAME}-internal OBJECT ${${VSOMEIP_NAME}_SRC})
 target_include_directories(${VSOMEIP_NAME}-internal PRIVATE ${VSOMEIP_INTERNAL_INCLUDE_DIRS})
-target_link_libraries(${VSOMEIP_NAME}-internal ${Boost_LIBRARIES} ${USE_RT} ${DL_LIBRARY} ${DLT_LIBRARIES} ${SystemD_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${VSOMEIP_NAME}-internal ${Boost_LIBRARIES} ${USE_RT} ${DL_LIBRARY} ${DLT_LIBRARIES} ${SystemD_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT} ${VSOMEIP_DTLS_LIBRARIES})
+target_compile_definitions(${VSOMEIP_NAME}-internal PRIVATE ${VSOMEIP_DTLS_DEFINITIONS})
 
 add_library(${VSOMEIP_NAME} SHARED $<TARGET_OBJECTS:${VSOMEIP_NAME}-internal>)
 # libvsomeip also `dlopens` other libs (cfg, sd, ..) so leave a rpath hint
@@ -425,7 +448,7 @@ target_include_directories(${VSOMEIP_NAME} INTERFACE
 # them (which shouldn't be required). ${Boost_LIBRARIES} includes absolute
 # build host paths as of writing, which also makes this important as it breaks
 # the build.
-target_link_libraries(${VSOMEIP_NAME} PRIVATE ${Boost_LIBRARIES} ${USE_RT} ${DL_LIBRARY} ${DLT_LIBRARIES} ${SystemD_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT} OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(${VSOMEIP_NAME} PRIVATE ${Boost_LIBRARIES} ${USE_RT} ${DL_LIBRARY} ${DLT_LIBRARIES} ${SystemD_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT} ${VSOMEIP_DTLS_LIBRARIES})
 
 if(NOT WIN32)
     target_link_options(${VSOMEIP_NAME} PRIVATE "LINKER:-as-needed")

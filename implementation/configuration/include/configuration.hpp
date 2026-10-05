@@ -312,6 +312,52 @@ public:
         static const std::string empty;
         return empty;
     }
+
+    /// OpenSSL cipher string for the DTLS endpoints.
+    virtual const std::string& get_dtls_cipher() const {
+        static const std::string empty;
+        return empty;
+    }
+
+    /// Identity and key this node presents to _address, so each pair of ECUs can
+    /// hold its own key. Falls back to the node-wide identity when no entry
+    /// matches. Returns false when the peer is configured but has no usable key.
+    virtual bool get_dtls_peer_credentials(const std::string& /*_address*/, std::string& _identity, std::string& _psk) const {
+        _identity = get_dtls_psk_identity();
+        _psk = get_dtls_psk();
+        return !_identity.empty() && !_psk.empty();
+    }
+
+    /// Key configured for an identity a peer presented, empty when unknown.
+    virtual std::string get_dtls_psk_for_identity(const std::string& _identity) const {
+        return _identity == get_dtls_psk_identity() ? get_dtls_psk() : std::string{};
+    }
+
+    /// True when peers authenticate with X.509 certificates instead of a PSK.
+    virtual bool is_dtls_certificate_mode() const { return false; }
+
+    /// Certificate mode: PEM chain of this node, its private key (file or
+    /// OSSL_STORE URI) and the CA bundle a peer chain must end in.
+    virtual const std::string& get_dtls_certificate() const {
+        static const std::string empty;
+        return empty;
+    }
+    virtual const std::string& get_dtls_private_key() const {
+        static const std::string empty;
+        return empty;
+    }
+    virtual const std::string& get_dtls_ca() const {
+        static const std::string empty;
+        return empty;
+    }
+
+    /// Certificate mode: SAN DNS name the certificate of the peer at _address
+    /// must carry. Empty when the address is not configured, which refuses it.
+    virtual std::string get_dtls_peer_name(const std::string& /*_address*/) const { return {}; }
+
+    /// Certificate mode: seconds since the epoch below which the system clock
+    /// is not trusted for certificate validity. 0 means the built-in default.
+    virtual std::int64_t get_dtls_time_floor() const { return 0; }
 };
 
 /// Inclusive port range.
