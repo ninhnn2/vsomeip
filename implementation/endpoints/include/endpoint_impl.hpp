@@ -56,6 +56,17 @@ protected:
     uint32_t find_magic_cookie(byte_t* _buffer, size_t _size);
     instance_t get_instance(service_t _service);
 
+    // DTLS sends one datagram as one record, which may hold less than a plain
+    // UDP datagram (1407 bytes with CBC-SHA256 against 1416). These keep sending
+    // within that limit; with dtls_record_limit_ 0 (no DTLS) they change nothing.
+    void set_dtls_record_limit(const std::string& _cipher_list);
+    // Largest datagram a train of messages may fill.
+    uint32_t get_datagram_limit() const;
+    // A message that fits a UDP datagram but not one DTLS record.
+    bool exceeds_dtls_record(uint32_t _size) const;
+    // A SOME/IP-TP segment length that keeps each segment within one record.
+    uint16_t fit_segment_length(uint16_t _configured) const;
+
 protected:
     enum class cms_ret_e : uint8_t { MSG_TOO_BIG, MSG_OK, MSG_WAS_SPLIT };
 
@@ -67,6 +78,10 @@ protected:
     std::weak_ptr<boardnet_routing_host> routing_host_;
 
     uint32_t max_message_size_;
+    // Largest SOME/IP datagram one DTLS record carries, 0 without DTLS. Only the
+    // sending side uses it: received datagrams are still checked against
+    // max_message_size_, whatever suite the peer negotiated.
+    uint32_t dtls_record_limit_{0};
 
     std::atomic<bool> sending_blocked_;
 

@@ -84,6 +84,7 @@ public:
     struct credentials {
         dtls_auth_e auth_{dtls_auth_e::PSK};
         std::string cipher_;       // empty: the default of the mode
+        std::string accelerator_;  // empty: CPU; "sa2ul": AES-CBC on the SA2UL (wolfSSL backend)
 
         // PSK mode
         std::string identity_;     // identity this node presents (client side)
@@ -109,6 +110,18 @@ public:
     void start();
     void feed(const std::uint8_t* _data, std::size_t _size);
     bool write(const std::uint8_t* _data, std::size_t _size, send_completion_t _completion);
+
+    // Fast path for the endpoints, application data only. Both run in the
+    // caller's context and leave delivery to it:
+    // - seal() turns one SOME/IP datagram into the record(s) to send and returns
+    //   them, instead of handing them to the send handler. False when the
+    //   session is not ready or the message cannot be sent (too large, failed).
+    // - feed(..., _plaintext) appends the authenticated messages of a datagram
+    //   to _plaintext instead of calling the plaintext handler.
+    // Handshake, alert and retransmission datagrams still go out through the
+    // send handler.
+    bool seal(const std::uint8_t* _data, std::size_t _size, std::vector<datagram_t>& _records);
+    void feed(const std::uint8_t* _data, std::size_t _size, std::vector<datagram_t>& _plaintext);
     bool is_ready() const;
     bool is_failed() const;
 
@@ -117,6 +130,9 @@ private:
                  plaintext_handler_t _receive);
 
     bool initialize();
+    // Encrypts one message with mutex_ held and the session ready; the records
+    // produced (normally one) are moved to _records.
+    bool write_locked(const std::uint8_t* _data, std::size_t _size, std::vector<datagram_t>& _records);
     bool initialize_psk();
     bool initialize_certificate();
     void log_handshake_failure(int _ssl_error);
@@ -139,6 +155,8 @@ private:
     // Custom transport: wolfSSL reads and writes our datagram queues, never a socket.
     static int io_recv(WOLFSSL* _ssl, char* _buffer, int _size, void* _context);
     static int io_send(WOLFSSL* _ssl, char* _buffer, int _size, void* _context);
+    // Crypto device: AES-CBC on the SA2UL and/or the private key in a PKCS#11 token.
+    bool attach_device();
     bool is_resend_locked(const std::vector<datagram_t>& _outgoing) const;
     void note_sent_locked(const std::vector<datagram_t>& _outgoing);
 #else
@@ -166,6 +184,7 @@ private:
     std::vector<unsigned char> psk_;
     psk_resolver_t resolver_;
     std::string cipher_;
+    std::string accelerator_;
     dtls_auth_e auth_;
     std::string certificate_;
     std::string private_key_;
@@ -186,6 +205,13 @@ private:
 #if defined(VSOMEIP_DTLS_BACKEND_WOLFSSL)
     WOLFSSL_CTX* context_{nullptr};
     WOLFSSL* ssl_{nullptr};
+    // wolfSSL_read() target, reused for every record (allocated once, never
+    // cleared): one record carries at most 2^14 bytes of plaintext.
+    datagram_t read_buffer_;
+    // wolfSSL crypto device (SA2UL, PKCS#11 token), INVALID_DEVID when unused,
+    // and the label of the private key when it lives in a token.
+    int device_id_{-2};
+    std::string key_label_;
     // wolfSSL reports a rejected certificate only as a handshake error; the
     // verify callback keeps the reason for log_handshake_failure().
     std::string verify_reason_;

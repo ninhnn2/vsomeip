@@ -102,6 +102,8 @@ protected:
     void start_connect_timer();
     void start_connecting_timer();
     bool check_message_size(uint32_t _size) const;
+    // The method of this serialized message has SOME/IP-TP configured.
+    bool tp_configured_for(const uint8_t* const _data);
     typename endpoint_impl<Protocol>::cms_ret_e segment_message(const uint8_t* const _data, uint32_t _size);
     bool check_queue_limit(const uint8_t* _data, uint32_t _size) const;
     // Bytes held in the batching stage (the current train_ plus all trains

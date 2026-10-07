@@ -188,6 +188,9 @@ void udp_server_endpoint_impl::init_unlocked(const endpoint_type& _local, boost:
         local_ = _local;
 
         queue_limit_ = configuration_->get_endpoint_queue_limit(configuration_->get_unicast_address().to_string(), local_.port());
+        if (use_dtls()) {
+            set_dtls_record_limit(configuration_->get_dtls_cipher());
+        }
     }
 }
 
@@ -482,24 +485,51 @@ bool udp_server_endpoint_impl::send_queued_dtls_unlocked(const target_data_itera
     auto its_buffer = its_entry.first;
     auto its_target = _it->first;
 
-    _it->second.is_sending_ = true;
-    const bool its_queued = its_session->write(its_buffer->data(), its_buffer->size(), [its_me, its_buffer, its_target](bool _ok) {
-        boost::asio::post(its_me->io_, [its_me, its_buffer, its_target, _ok]() {
-            const boost::system::error_code its_error = _ok ? boost::system::error_code{} : boost::asio::error::operation_aborted;
-            if (_ok && its_me->on_unicast_sent_ && !its_target.address().is_multicast()) {
-                its_me->on_unicast_sent_(its_buffer->data(), static_cast<uint32_t>(its_buffer->size()), its_target.address());
-            }
-            its_me->send_cbk(its_target, its_error, _ok ? its_buffer->size() : 0U);
-        });
-    });
-
-    if (!its_queued) {
+    // Encrypt here and put the record on the socket directly, as the plaintext
+    // path does: the caller already holds sync_, so there is no need to go through
+    // the session's send handler and the io_context (that handler stays for the
+    // handshake, which runs where sync_ is not held).
+    std::vector<dtls_session::datagram_t> its_records;
+    if (!its_session->seal(its_buffer->data(), its_buffer->size(), its_records)) {
+        // Too large for one record, or the session failed: report it like a
+        // failed send (send_cbk() drops the target's queue). An alert the session
+        // produced still goes out.
+        send_records_unlocked(std::move(its_records), its_target);
         _it->second.is_sending_ = false;
+        boost::asio::post(io_, [its_me, its_target]() { its_me->send_cbk(its_target, boost::asio::error::operation_aborted, 0U); });
+        return false;
+    }
+    if (its_records.empty()) {
+        _it->second.is_sending_ = false;
+        return false;
     }
 
-    // Same contract as the plaintext path: true means a send is in flight, so the
-    // caller keeps is_sending_ set and waits for send_cbk() to drain the queue.
-    return its_queued;
+    // Normally one record. Any earlier ones go out first; the last one completes
+    // the send, with the same contract as the plaintext path: true means a send is
+    // in flight, and send_cbk() drains the queue.
+    auto its_record = std::make_shared<dtls_session::datagram_t>(std::move(its_records.back()));
+    its_records.pop_back();
+    send_records_unlocked(std::move(its_records), its_target);
+
+    _it->second.is_sending_ = true;
+    unicast_socket_->async_send_to(boost::asio::buffer(*its_record), its_target,
+                                   [its_me, its_buffer, its_record, its_target](const boost::system::error_code& _error, size_t) {
+                                       if (!_error && its_me->on_unicast_sent_ && !its_target.address().is_multicast()) {
+                                           its_me->on_unicast_sent_(its_buffer->data(), static_cast<uint32_t>(its_buffer->size()),
+                                                                    its_target.address());
+                                       }
+                                       its_me->send_cbk(its_target, _error, _error ? 0U : its_buffer->size());
+                                   });
+    return true;
+}
+
+void udp_server_endpoint_impl::send_records_unlocked(std::vector<dtls_session::datagram_t>&& _records, const endpoint_type& _target) {
+    // The caller holds `sync_`. Fire and forget: the queue does not wait for these.
+    for (auto& its_datagram : _records) {
+        auto its_record = std::make_shared<dtls_session::datagram_t>(std::move(its_datagram));
+        unicast_socket_->async_send_to(boost::asio::buffer(*its_record), _target,
+                                       [its_record](const boost::system::error_code&, size_t) { });
+    }
 }
 
 void udp_server_endpoint_impl::get_configured_times_from_endpoint(service_t _service, method_t _method,
@@ -665,6 +695,7 @@ void udp_server_endpoint_impl::feed_dtls_unicast(const message_buffer_t& _unicas
             // identity, so hand the session a resolver instead of one key.
             dtls_session::credentials its_credentials;
             its_credentials.cipher_ = configuration_->get_dtls_cipher();
+            its_credentials.accelerator_ = configuration_->get_dtls_accelerator();
             if (configuration_->is_dtls_certificate_mode()) {
                 // The client is known by its address before any certificate is
                 // seen, so the name it must prove is fixed up front.
@@ -737,7 +768,14 @@ void udp_server_endpoint_impl::feed_dtls_unicast(const message_buffer_t& _unicas
         return;
     }
 
-    its_session->feed(_unicast_recv_buffer.data(), _bytes);
+    // Authenticated plaintext comes back here and is handled in this receive
+    // context, exactly like a plaintext datagram: no hop through the io_context
+    // and no copy (the session's message buffer is passed on as it is).
+    std::vector<dtls_session::datagram_t> its_plaintext;
+    its_session->feed(_unicast_recv_buffer.data(), _bytes, its_plaintext);
+    for (const auto& its_message : its_plaintext) {
+        on_message_received_unlocked({}, its_message.size(), false, its_peer, its_message);
+    }
     if (its_session->is_failed()) {
         std::scoped_lock its_lock(sync_);
         const auto its_current = dtls_sessions_.find(its_key);

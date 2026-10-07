@@ -38,6 +38,9 @@ udp_client_endpoint_impl::udp_client_endpoint_impl(const std::shared_ptr<boardne
 
     this->max_message_size_ = VSOMEIP_MAX_UDP_MESSAGE_SIZE;
     this->queue_limit_ = _configuration->get_endpoint_queue_limit(_remote.address().to_string(), _remote.port());
+    if (use_dtls()) {
+        set_dtls_record_limit(_configuration->get_dtls_cipher());
+    }
 }
 
 udp_client_endpoint_impl::~udp_client_endpoint_impl() {
@@ -181,6 +184,7 @@ void udp_client_endpoint_impl::connect_cbk(const boost::system::error_code& _err
     // its own credentials instead of one key shared by the whole network.
     dtls_session::credentials its_credentials;
     its_credentials.cipher_ = configuration_->get_dtls_cipher();
+    its_credentials.accelerator_ = configuration_->get_dtls_accelerator();
     const std::string its_remote = remote_.address().to_string();
     if (configuration_->is_dtls_certificate_mode()) {
         its_credentials.auth_ = dtls_auth_e::CERTIFICATE;
@@ -301,19 +305,6 @@ void udp_client_endpoint_impl::wait_tp_separation_time(uint32_t _separation_time
 }
 
 void udp_client_endpoint_impl::send_queued_dtls(std::pair<message_buffer_ptr_t, uint32_t>& _entry) {
-    // OpenSSL can emit records synchronously from write(), and the send handler takes
-    // socket_mutex_ itself, so this path must not hold that lock while writing.
-    {
-        std::scoped_lock its_socket_lock(socket_mutex_);
-        if (!socket_->is_open()) {
-            VSOMEIP_WARNING_P << "socket is closed";
-            state_ = cei_state_e::CLOSED;
-            was_not_connected_ = true;
-            is_sending_ = false;
-            return;
-        }
-    }
-
     auto its_session = dtls_session_;
     if (!its_session || !its_session->is_ready()) {
         // Handshake is not finished yet. Leave the entry queued; resume_dtls_queue()
@@ -322,19 +313,50 @@ void udp_client_endpoint_impl::send_queued_dtls(std::pair<message_buffer_ptr_t, 
         return;
     }
 
-    wait_tp_separation_time(_entry.second);
-
+    // Encrypt first, outside socket_mutex_ (the session may use the SA2UL, and the
+    // receive path takes that lock to re-arm the socket), then put the record on the
+    // socket directly, as the plaintext path does. The session's send handler is
+    // only used for the handshake.
     auto self = std::dynamic_pointer_cast<udp_client_endpoint_impl>(shared_from_this());
     auto its_message = _entry.first;
-    const bool its_queued = its_session->write(its_message->data(), its_message->size(), [self, its_message](bool _ok) {
-        boost::asio::post(self->strand_, [self, its_message, _ok]() {
-            const boost::system::error_code its_error = _ok ? boost::system::error_code{} : boost::asio::error::operation_aborted;
-            self->send_cbk(its_error, _ok ? its_message->size() : 0U, its_message);
-        });
-    });
+    std::vector<dtls_session::datagram_t> its_records;
+    const bool its_sealed = its_session->seal(its_message->data(), its_message->size(), its_records);
 
-    if (!its_queued) {
+    std::scoped_lock its_socket_lock(socket_mutex_);
+    if (!socket_->is_open()) {
+        VSOMEIP_WARNING_P << "socket is closed";
+        state_ = cei_state_e::CLOSED;
+        was_not_connected_ = true;
         is_sending_ = false;
+        return;
+    }
+    if (!its_sealed || its_records.empty()) {
+        // Too large for one record, or the session failed: report it like a failed
+        // send. An alert the session produced still goes out.
+        send_records_unlocked(std::move(its_records));
+        is_sending_ = false;
+        boost::asio::post(strand_,
+                          [self, its_message]() { self->send_cbk(boost::asio::error::operation_aborted, 0U, its_message); });
+        return;
+    }
+
+    wait_tp_separation_time(_entry.second);
+
+    // Normally one record; any earlier ones go out first, the last completes the send.
+    auto its_record = std::make_shared<dtls_session::datagram_t>(std::move(its_records.back()));
+    its_records.pop_back();
+    send_records_unlocked(std::move(its_records));
+    socket_->async_send(boost::asio::buffer(*its_record),
+                        [self, its_message, its_record](const boost::system::error_code& _error, std::size_t) {
+                            self->send_cbk(_error, _error ? 0U : its_message->size(), its_message);
+                        });
+}
+
+void udp_client_endpoint_impl::send_records_unlocked(std::vector<dtls_session::datagram_t>&& _records) {
+    // The caller holds socket_mutex_. Fire and forget: the queue does not wait for these.
+    for (auto& its_datagram : _records) {
+        auto its_record = std::make_shared<dtls_session::datagram_t>(std::move(its_datagram));
+        socket_->async_send(boost::asio::buffer(*its_record), [its_record](const boost::system::error_code&, std::size_t) { });
     }
 }
 
@@ -427,7 +449,10 @@ void udp_client_endpoint_impl::receive_cbk(boost::system::error_code const& _err
 
 void udp_client_endpoint_impl::handle_dtls_datagram(boost::system::error_code const& _error, size_t _bytes,
                                                    std::shared_ptr<message_buffer_t> _recv_buffer) {
-    if (!dtls_session_) {
+    // Local reference: the plaintext is parsed synchronously below, and that may
+    // restart this endpoint (which resets dtls_session_).
+    const auto its_session = dtls_session_;
+    if (!its_session) {
         // DTLS was requested but no session exists. Drop the datagram instead of
         // interpreting it as plaintext SOME/IP - there is no plaintext downgrade.
         if (!_error) {
@@ -437,8 +462,15 @@ void udp_client_endpoint_impl::handle_dtls_datagram(boost::system::error_code co
     }
 
     if (!_error && _bytes > 0) {
-        dtls_session_->feed(_recv_buffer->data(), _bytes);
-        if (dtls_session_->is_failed()) {
+        // Authenticated plaintext comes back here and is parsed right away on this
+        // strand, without another post and without copying it again.
+        std::vector<dtls_session::datagram_t> its_plaintext;
+        its_session->feed(_recv_buffer->data(), _bytes, its_plaintext);
+        for (auto& its_message : its_plaintext) {
+            const auto its_size = its_message.size();
+            receive_cbk_impl({}, its_size, std::make_shared<message_buffer_t>(std::move(its_message)), false);
+        }
+        if (its_session->is_failed()) {
             // 100 ms, 200 ms, ... capped at 30 s.
             const auto its_shift = std::min<std::uint32_t>(dtls_failures_, 9U);
             const auto its_delay = std::min(std::chrono::milliseconds(100U << its_shift), std::chrono::milliseconds(30000));
@@ -446,7 +478,9 @@ void udp_client_endpoint_impl::handle_dtls_datagram(boost::system::error_code co
             VSOMEIP_WARNING_P << "DTLS: session failed (attempt " << dtls_failures_ << "), reconnecting in "
                               << its_delay.count() << " ms. remote: " << get_address_port_remote();
             notify_disconnect();
-            dtls_session_.reset();  // drop anything else from this peer until the retry
+            if (dtls_session_ == its_session) {
+                dtls_session_.reset();  // drop anything else from this peer until the retry
+            }
             auto its_weak_self = std::weak_ptr<udp_client_endpoint_impl>(
                     std::dynamic_pointer_cast<udp_client_endpoint_impl>(shared_from_this()));
             dtls_backoff_timer_.expires_after(its_delay);
@@ -458,7 +492,7 @@ void udp_client_endpoint_impl::handle_dtls_datagram(boost::system::error_code co
             }));
             return;
         }
-        if (dtls_session_->is_ready()) {
+        if (its_session->is_ready()) {
             dtls_failures_ = 0;
         }
         resume_dtls_queue();

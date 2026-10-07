@@ -25,7 +25,12 @@
 
 #include <boost/asio/io_context.hpp>
 
+#include "../../../implementation/endpoints/include/dtls_record_limit.hpp"
 #include "../../../implementation/endpoints/include/dtls_session.hpp"
+#include "../../../implementation/endpoints/include/tp.hpp"
+#if defined(VSOMEIP_DTLS_BACKEND_WOLFSSL)
+#include "../../../implementation/endpoints/include/dtls_wolfssl_device.hpp"
+#endif
 
 using namespace vsomeip_v3;
 using namespace std::chrono_literals;
@@ -323,7 +328,7 @@ TEST_F(dtls_session_test, largest_someip_message_is_one_record_in_one_datagram) 
         ASSERT_TRUE(send(client_, big));
         ASSERT_EQ(sent_by_client_.size(), before + 1U) << "message split across datagrams";
         EXPECT_EQ(sent_by_client_.back()[0], CONTENT_APPLICATION_DATA);
-        EXPECT_LE(sent_by_client_.back().size(), 1500U);
+        EXPECT_LE(sent_by_client_.back().size(), 1472U) << "must fit one Ethernet frame without IP fragmentation";
         ASSERT_TRUE(run_until([this] { return received_by_server_.size() == 1U; }));
         EXPECT_EQ(received_by_server_[0], big);
     }
@@ -567,6 +572,11 @@ TEST_F(dtls_session_test, server_trusting_a_rogue_ca_refuses_the_real_client) {
 
 TEST_F(dtls_session_test, expired_certificate_is_refused) {
     REQUIRE_PKI();
+    // The "expired" certificate of pki.sh is valid 2026-01-01 .. 2026-06-01. On a
+    // machine whose (trusted) clock is still before its end it is not expired.
+    if (std::time(nullptr) < 1780272000) {
+        GTEST_SKIP() << "the clock of this machine is before 2026-06-01, when the test certificate expires";
+    }
     auto client = cert_side(true);
     client.certificate_ = pki::get().bad("expired", "node.crt");
     client.private_key_ = pki::get().bad("expired", "node.key");
@@ -695,4 +705,311 @@ TEST_F(dtls_session_test, invalid_certificate_configuration_is_rejected_at_creat
     }
 }
 
+// ------------------------------------------------- accelerator / token -------
+
+dtls_session::credentials with_accelerator(dtls_session::credentials _credentials, const std::string& _accelerator) {
+    _credentials.accelerator_ = _accelerator;
+    return _credentials;
+}
+
+TEST_F(dtls_session_test, sa2ul_accelerator_interoperates_with_cpu_cbc) {
+    // Client encrypts AES-CBC on the SA2UL when the machine has one (else on the
+    // CPU, with a warning); the server always on the CPU. Records of every size
+    // in both directions prove the CBC chaining matches a software peer.
+    const char* cipher = "PSK-AES128-CBC-SHA256";
+#if defined(VSOMEIP_DTLS_BACKEND_WOLFSSL)
+    const auto before = dtls_wolfssl::sa2ul_operations();
+#endif
+    ASSERT_TRUE(create(with_accelerator(psk_client(cipher), "sa2ul"), psk_server(cipher)));
+    ASSERT_TRUE(handshake());
+    std::size_t expected = 0;
+    for (std::size_t size : {1U, 15U, 16U, 17U, 100U, 1024U, 1391U, 1407U}) {
+        const auto up = message(size, static_cast<std::uint8_t>(size));
+        ASSERT_TRUE(send(client_, up)) << size;
+        ASSERT_TRUE(send(server_, up)) << size;
+        ++expected;
+        ASSERT_TRUE(run_until([this, expected] {
+            return received_by_server_.size() == expected && received_by_client_.size() == expected;
+        })) << size;
+        EXPECT_EQ(received_by_server_.back(), up) << size;
+        EXPECT_EQ(received_by_client_.back(), up) << size;
+    }
+#if defined(VSOMEIP_DTLS_BACKEND_WOLFSSL)
+    if (dtls_wolfssl::sa2ul_operations() == before) {
+        GTEST_SKIP() << "no SA2UL on this machine: the exchange ran on the CPU (still verified above)";
+    }
+    EXPECT_GE(dtls_wolfssl::sa2ul_operations() - before, 2U * expected);
+#endif
+}
+
+TEST_F(dtls_session_test, sa2ul_accelerator_on_both_sides) {
+    const char* cipher = "ECDHE-PSK-AES128-CBC-SHA256";
+    ASSERT_TRUE(create(with_accelerator(psk_client(cipher), "sa2ul"), with_accelerator(psk_server(cipher), "sa2ul")));
+    ASSERT_TRUE(handshake());
+    const auto big = message(1407, 21);  // largest CBC-SHA256 message in one frame
+    ASSERT_TRUE(send(client_, big));
+    ASSERT_TRUE(run_until([this] { return received_by_server_.size() == 1U; }));
+    EXPECT_EQ(received_by_server_[0], big);
+}
+
+TEST_F(dtls_session_test, cbc_sha256_fits_one_frame_up_to_1407_bytes) {
+    // CBC-SHA256 (the suites the SA2UL can run): 1407 bytes is the largest
+    // message in a 1472-byte datagram. A larger one is refused, not fragmented,
+    // and the session carries on.
+    for (const char* cipher : {"PSK-AES128-CBC-SHA256", "ECDHE-PSK-AES128-CBC-SHA256"}) {
+        SCOPED_TRACE(cipher);
+        sent_by_client_.clear();
+        received_by_server_.clear();
+        ASSERT_TRUE(create(psk_client(cipher), psk_server(cipher)));
+        ASSERT_TRUE(handshake());
+        const auto fits = message(1407, 23);
+        const auto before = sent_by_client_.size();
+        ASSERT_TRUE(send(client_, fits));
+        ASSERT_EQ(sent_by_client_.size(), before + 1U);
+        EXPECT_LE(sent_by_client_.back().size(), 1472U);
+        ASSERT_TRUE(run_until([this] { return received_by_server_.size() == 1U; }));
+        EXPECT_EQ(received_by_server_[0], fits);
+        if (is_wolfssl()) {
+            EXPECT_FALSE(send(client_, message(1416, 24))) << "1485-byte datagram would be IP-fragmented";
+            EXPECT_FALSE(client_->is_failed());
+        }
+        ASSERT_TRUE(send(client_, message(64, 25)));
+        EXPECT_TRUE(run_until([this] { return received_by_server_.size() == 2U; }));
+    }
+}
+
+TEST_F(dtls_session_test, sa2ul_accelerator_with_gcm_still_works) {
+    // The SA2UL has no GCM: the option must not break a GCM session.
+    ASSERT_TRUE(create(with_accelerator(psk_client(), "sa2ul"), psk_server()));
+    ASSERT_TRUE(handshake());
+    ASSERT_TRUE(send(client_, message(300, 22)));
+    EXPECT_TRUE(run_until([this] { return received_by_server_.size() == 1U; }));
+}
+
+#if defined(VSOMEIP_DTLS_BACKEND_WOLFSSL)
+TEST(dtls_pkcs11_uri, parses_rfc7512_uri) {
+    dtls_wolfssl::pkcs11_uri uri;
+    std::string reason;
+    ASSERT_TRUE(dtls_wolfssl::parse_pkcs11_uri(
+            "pkcs11:token=vsomeip%2Ddtls;object=dtls-identity;type=private"
+            "?module-path=/usr/lib/libckteec.so.0&pin-source=file:/etc/dtls/token.pin",
+            uri, reason))
+            << reason;
+    EXPECT_EQ(uri.token_, "vsomeip-dtls");
+    EXPECT_EQ(uri.object_, "dtls-identity");
+    EXPECT_EQ(uri.module_, "/usr/lib/libckteec.so.0");
+    EXPECT_EQ(uri.pin_file_, "/etc/dtls/token.pin");
+}
+
+TEST(dtls_pkcs11_uri, refuses_incomplete_or_unsafe_uris) {
+    dtls_wolfssl::pkcs11_uri uri;
+    std::string reason;
+    EXPECT_FALSE(dtls_wolfssl::parse_pkcs11_uri("pkcs11:token=t;object=o", uri, reason)) << "no module, no pin";
+    EXPECT_FALSE(dtls_wolfssl::parse_pkcs11_uri("pkcs11:token=t;object=o?module-path=/m.so&pin-value=1234", uri, reason))
+            << "PIN in the configuration";
+    EXPECT_NE(reason.find("pin-source"), std::string::npos);
+    EXPECT_FALSE(dtls_wolfssl::parse_pkcs11_uri("pkcs11:token=t;object=o;type=public?module-path=/m.so&pin-source=/p",
+                                                uri, reason))
+            << "public key";
+    EXPECT_FALSE(dtls_wolfssl::parse_pkcs11_uri("file:/etc/key.pem", uri, reason));
+    EXPECT_TRUE(dtls_wolfssl::parse_pkcs11_uri("pkcs11:object=o;token=t?pin-source=/p&module-path=/m.so%", uri, reason))
+            << "malformed escape kept literally: " << reason;
+    EXPECT_EQ(uri.module_, "/m.so%");
+}
+
+TEST_F(dtls_session_test, token_key_with_unsafe_pin_file_or_missing_module_is_refused) {
+    REQUIRE_PKI();
+    auto nop_send = [](datagram_t, dtls_session::send_completion_t) {};
+    auto nop_receive = [](datagram_t) {};
+    const std::string pin = pki::get().path("token.pin");
+    {
+        std::ofstream(pin) << "1234\n";
+    }
+    std::filesystem::permissions(pin, std::filesystem::perms::owner_read | std::filesystem::perms::group_read
+                                              | std::filesystem::perms::others_read);
+    auto open_pin = cert_side(false);
+    open_pin.private_key_ = "pkcs11:token=t;object=dtls-identity?module-path=/nonexistent/libp11.so&pin-source=file:" + pin;
+    EXPECT_EQ(dtls_session::create(io_, false, open_pin, nop_send, nop_receive), nullptr) << "PIN file readable by others";
+
+    std::filesystem::permissions(pin, std::filesystem::perms::owner_read);
+    EXPECT_EQ(dtls_session::create(io_, false, open_pin, nop_send, nop_receive), nullptr) << "module does not exist";
+}
+#endif
+
+TEST(dtls_record_limit, payload_per_suite) {
+    // Block ciphers: explicit IV, MAC and at least one padding byte in 1472 - 13.
+    EXPECT_EQ(dtls::max_record_payload("ECDHE-ECDSA-AES128-SHA256"), 1407U);
+    EXPECT_EQ(dtls::max_record_payload("PSK-AES128-CBC-SHA256"), 1407U);
+    EXPECT_EQ(dtls::max_record_payload("TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256"), 1407U);
+    EXPECT_EQ(dtls::max_record_payload("PSK-AES256-CBC-SHA384"), 1391U);
+    EXPECT_EQ(dtls::max_record_payload("ECDHE-ECDSA-AES128-SHA"), 1407U) << "encrypt-then-MAC bound";
+    // AEAD: a 1416-byte SOME/IP datagram always fits.
+    EXPECT_EQ(dtls::max_record_payload("PSK-AES128-GCM-SHA256"), 1435U);
+    EXPECT_EQ(dtls::max_record_payload("ECDHE-ECDSA-AES128-GCM-SHA256"), 1435U);
+    EXPECT_EQ(dtls::max_record_payload("PSK-AES128-CCM"), 1435U);
+    EXPECT_EQ(dtls::max_record_payload("PSK-AES128-CCM8"), 1443U);
+    EXPECT_EQ(dtls::max_record_payload("ECDHE-PSK-CHACHA20-POLY1305"), 1443U);
+    EXPECT_EQ(dtls::max_record_payload("PSK-NULL-SHA256"), 1427U);
+    // Not a suite: the smallest supported value.
+    EXPECT_EQ(dtls::max_record_payload("DEFAULT"), 1391U);
+}
+
+TEST(dtls_record_limit, list_takes_the_smallest) {
+    EXPECT_EQ(dtls::max_message_size("ECDHE-ECDSA-AES128-GCM-SHA256"), 1435U);
+    EXPECT_EQ(dtls::max_message_size("ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-SHA256"), 1407U);
+    EXPECT_EQ(dtls::max_message_size("ECDHE-ECDSA-AES128-GCM-SHA256:!aNULL:@STRENGTH"), 1435U);
+    EXPECT_EQ(dtls::max_message_size(""), 1391U);
+}
+
+TEST(dtls_record_limit, tp_splits_a_message_between_record_and_udp_limit) {
+    // Payload 1400: the datagram (1416) fits UDP but not one CBC-SHA256 record
+    // (1407). It must split into segments that each fit a record.
+    const std::size_t limit = dtls::max_message_size("ECDHE-ECDSA-AES128-SHA256");
+    for (std::size_t payload : {1392U, 1400U}) {
+        SCOPED_TRACE(payload);
+        datagram_t data = message(VSOMEIP_FULL_HEADER_SIZE + payload, 41);
+        data[VSOMEIP_MESSAGE_TYPE_POS] = 0x00; // request
+        const auto segments = tp::tp::tp_split_message(data.data(), static_cast<std::uint32_t>(data.size()), 1376);
+        ASSERT_EQ(segments.size(), 2U);
+        std::size_t carried = 0;
+        for (const auto& segment : segments) {
+            EXPECT_LE(segment->size(), limit);
+            EXPECT_TRUE(tp::tp::tp_flag_is_set((*segment)[VSOMEIP_MESSAGE_TYPE_POS]));
+            carried += segment->size() - VSOMEIP_FULL_HEADER_SIZE - VSOMEIP_TP_HEADER_SIZE;
+        }
+        EXPECT_EQ(carried, payload);
+    }
+    // Nothing to split: one segment would hold it all.
+    const datagram_t small = message(VSOMEIP_FULL_HEADER_SIZE + 1376, 42);
+    EXPECT_TRUE(tp::tp::tp_split_message(small.data(), static_cast<std::uint32_t>(small.size()), 1376).empty());
+    EXPECT_TRUE(tp::tp::tp_split_message(small.data(), static_cast<std::uint32_t>(small.size()), 0).empty());
+}
+
+TEST_F(dtls_session_test, record_limit_matches_the_tls_library) {
+    // max_message_size() decides when the endpoints segment. It must equal what
+    // the TLS library really fits: a message of the limit goes out in one
+    // datagram of at most 1472 bytes, and (wolfSSL, which refuses rather than
+    // IP-fragments) one byte more does not.
+    for (const char* cipher :
+         {"PSK-AES128-CBC-SHA256", "PSK-AES256-CBC-SHA384", "PSK-AES128-GCM-SHA256", "ECDHE-PSK-CHACHA20-POLY1305"}) {
+        SCOPED_TRACE(cipher);
+        sent_by_client_.clear();
+        received_by_server_.clear();
+        ASSERT_TRUE(create(psk_client(cipher), psk_server(cipher)));
+        ASSERT_TRUE(handshake());
+        const std::size_t limit = dtls::max_message_size(cipher);
+        const auto fits = message(limit, 43);
+        const auto before = sent_by_client_.size();
+        ASSERT_TRUE(send(client_, fits));
+        ASSERT_EQ(sent_by_client_.size(), before + 1U);
+        EXPECT_LE(sent_by_client_.back().size(), dtls::DATAGRAM_SIZE);
+        ASSERT_TRUE(run_until([this] { return received_by_server_.size() == 1U; }));
+        EXPECT_EQ(received_by_server_[0], fits);
+        if (is_wolfssl()) {
+            EXPECT_FALSE(send(client_, message(limit + 1U, 44))) << "limit is not tight";
+            EXPECT_FALSE(client_->is_failed());
+        }
+    }
+}
+
+// Endpoint fast path: seal() returns the record instead of calling the send
+// handler, feed(..., out) returns the plaintext instead of calling the plaintext
+// handler. Both must interoperate with the handler-based calls.
+TEST_F(dtls_session_test, seal_and_feed_out_bypass_the_handlers) {
+    ASSERT_TRUE(create(psk_client(), psk_server()));
+    ASSERT_TRUE(handshake());
+    const auto sent_before = sent_by_client_.size();
+
+    const auto first = message(1200, 51);
+    std::vector<datagram_t> records;
+    ASSERT_TRUE(client_->seal(first.data(), first.size(), records));
+    ASSERT_EQ(records.size(), 1U);
+    EXPECT_LE(records[0].size(), dtls::DATAGRAM_SIZE);
+    EXPECT_EQ(sent_by_client_.size(), sent_before) << "seal() must not use the send handler";
+
+    std::vector<datagram_t> plaintext{message(3, 52)}; // existing content is kept
+    server_->feed(records[0].data(), records[0].size(), plaintext);
+    ASSERT_EQ(plaintext.size(), 2U);
+    EXPECT_EQ(plaintext[1], first);
+    EXPECT_TRUE(received_by_server_.empty()) << "feed(..., out) must not use the plaintext handler";
+
+    // A sealed record also opens through the handler-based feed(), and a record
+    // from write() through feed(..., out).
+    const auto second = message(64, 53);
+    records.clear();
+    ASSERT_TRUE(client_->seal(second.data(), second.size(), records));
+    ASSERT_EQ(records.size(), 1U);
+    server_->feed(records[0].data(), records[0].size());
+    ASSERT_EQ(received_by_server_.size(), 1U);
+    EXPECT_EQ(received_by_server_[0], second);
+
+    const auto third = message(700, 54);
+    ASSERT_TRUE(send(server_, third));
+    ASSERT_FALSE(sent_by_server_.empty());
+    std::vector<datagram_t> back;
+    client_->feed(sent_by_server_.back().data(), sent_by_server_.back().size(), back);
+    ASSERT_EQ(back.size(), 1U);
+    EXPECT_EQ(back[0], third);
+}
+
+TEST_F(dtls_session_test, seal_before_the_handshake_is_refused) {
+    ASSERT_TRUE(create(psk_client(), psk_server()));
+    const auto data = message(100, 55);
+    std::vector<datagram_t> records;
+    EXPECT_FALSE(client_->seal(data.data(), data.size(), records));
+    EXPECT_TRUE(records.empty());
+    EXPECT_FALSE(client_->seal(nullptr, 0, records));
+    ASSERT_TRUE(handshake()) << "a refused seal() must not disturb the handshake";
+}
+
+TEST_F(dtls_session_test, seal_refuses_a_message_over_the_record_limit) {
+    const char* cipher = "PSK-AES128-CBC-SHA256";
+    ASSERT_TRUE(create(psk_client(cipher), psk_server(cipher)));
+    ASSERT_TRUE(handshake());
+    const std::size_t limit = dtls::max_message_size(cipher);
+    std::vector<datagram_t> records;
+    const auto fits = message(limit, 56);
+    ASSERT_TRUE(client_->seal(fits.data(), fits.size(), records));
+    ASSERT_EQ(records.size(), 1U);
+    EXPECT_LE(records[0].size(), dtls::DATAGRAM_SIZE);
+    if (is_wolfssl()) {
+        std::vector<datagram_t> refused;
+        const auto too_big = message(limit + 1U, 57);
+        EXPECT_FALSE(client_->seal(too_big.data(), too_big.size(), refused));
+        EXPECT_TRUE(refused.empty());
+        EXPECT_FALSE(client_->is_failed()) << "one oversize message must not end the session";
+    }
+    std::vector<datagram_t> plaintext;
+    server_->feed(records[0].data(), records[0].size(), plaintext);
+    ASSERT_EQ(plaintext.size(), 1U);
+    EXPECT_EQ(plaintext[0], fits);
+}
+
+TEST_F(dtls_session_test, sealed_records_keep_their_order_and_detect_tampering) {
+    ASSERT_TRUE(create(psk_client(), psk_server()));
+    ASSERT_TRUE(handshake());
+    std::vector<datagram_t> records;
+    for (std::uint8_t i = 0; i < 20U; ++i) {
+        const auto data = message(100U + i, i);
+        ASSERT_TRUE(client_->seal(data.data(), data.size(), records));
+    }
+    ASSERT_EQ(records.size(), 20U);
+    std::vector<datagram_t> plaintext;
+    for (const auto& record : records) {
+        server_->feed(record.data(), record.size(), plaintext);
+    }
+    ASSERT_EQ(plaintext.size(), 20U);
+    for (std::uint8_t i = 0; i < 20U; ++i) {
+        EXPECT_EQ(plaintext[i], message(100U + i, i));
+    }
+    // Replayed and tampered records are dropped, not delivered.
+    std::vector<datagram_t> none;
+    server_->feed(records[3].data(), records[3].size(), none);
+    auto tampered = records.back();
+    tampered.back() ^= 0x01U;
+    server_->feed(tampered.data(), tampered.size(), none);
+    EXPECT_TRUE(none.empty());
+}
+
 } // namespace
+

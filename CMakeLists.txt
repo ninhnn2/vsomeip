@@ -406,7 +406,7 @@ endif()
 if (VSOMEIP_DTLS_BACKEND STREQUAL "wolfssl")
     list(FILTER ${VSOMEIP_NAME}_SRC EXCLUDE REGEX ".*/dtls_session\\.cpp$")
 else ()
-    list(FILTER ${VSOMEIP_NAME}_SRC EXCLUDE REGEX ".*/dtls_session_wolfssl\\.cpp$")
+    list(FILTER ${VSOMEIP_NAME}_SRC EXCLUDE REGEX ".*/dtls_.*wolfssl.*\\.cpp$")
 endif ()
 
 list(SORT ${VSOMEIP_NAME}_SRC)

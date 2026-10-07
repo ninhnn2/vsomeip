@@ -141,7 +141,7 @@ bool server_endpoint_impl<Protocol>::send_intern(endpoint_type _target, const by
         return false;
     }
 
-    if (!check_message_size(_size)) {
+    if (!check_message_size(_size) || (endpoint_impl<Protocol>::exceeds_dtls_record(_size) && tp_configured_for(_data))) {
         return segment_message(_data, _size, _target) == endpoint_impl<Protocol>::cms_ret_e::MSG_WAS_SPLIT;
     }
 
@@ -170,7 +170,7 @@ bool server_endpoint_impl<Protocol>::send_intern(endpoint_type _target, const by
             return true;
         }
         // STEP 5: Check whether the current message fits into the current train
-        if (its_data.train_->buffer_->size() + _size > endpoint_impl<Protocol>::max_message_size_) {
+        if (its_data.train_->buffer_->size() + _size > endpoint_impl<Protocol>::get_datagram_limit()) {
             return true;
         }
         // STEP 6: Check debouncing time
@@ -335,6 +335,17 @@ void server_endpoint_impl<Protocol>::schedule_train(endpoint_data_type& _data) {
 }
 
 template<typename Protocol>
+bool server_endpoint_impl<Protocol>::tp_configured_for(const byte_t* const _data) {
+    if (!endpoint_impl<Protocol>::is_supporting_someip_tp_ || _data == nullptr) {
+        return false;
+    }
+    const service_t its_service = bithelper::read_uint16_be(&_data[VSOMEIP_SERVICE_POS_MIN]);
+    const method_t its_method = bithelper::read_uint16_be(&_data[VSOMEIP_METHOD_POS_MIN]);
+    const instance_t its_instance = this->get_instance(its_service);
+    return its_instance != ANY_INSTANCE && tp_segmentation_enabled({its_service, its_instance}, its_method);
+}
+
+template<typename Protocol>
 bool server_endpoint_impl<Protocol>::check_message_size(uint32_t _size) const {
     return !(_size > endpoint_impl<Protocol>::max_message_size_);
 }
@@ -355,13 +366,17 @@ typename endpoint_impl<Protocol>::cms_ret_e server_endpoint_impl<Protocol>::segm
 
                 this->configuration_->get_tp_configuration(its_service, its_instance, its_method, false, its_max_segment_length,
                                                            its_separation_time);
-                send_segments(tp::tp::tp_split_message(_data, _size, its_max_segment_length), its_separation_time, _target);
-                return endpoint_impl<Protocol>::cms_ret_e::MSG_WAS_SPLIT;
+                its_max_segment_length = endpoint_impl<Protocol>::fit_segment_length(its_max_segment_length);
+                const auto its_segments = tp::tp::tp_split_message(_data, _size, its_max_segment_length);
+                if (!its_segments.empty()) {
+                    send_segments(its_segments, its_separation_time, _target);
+                    return endpoint_impl<Protocol>::cms_ret_e::MSG_WAS_SPLIT;
+                }
             }
         }
     }
     VSOMEIP_ERROR_P << "Dropping to big message (" << _size
-                    << " Bytes). Maximum allowed message size is: " << endpoint_impl<Protocol>::max_message_size_ << " Bytes.";
+                    << " Bytes). Maximum allowed message size is: " << endpoint_impl<Protocol>::get_datagram_limit() << " Bytes.";
     return endpoint_impl<Protocol>::cms_ret_e::MSG_TOO_BIG;
 }
 

@@ -25,8 +25,11 @@ tp_split_messages_t tp::tp_split_message(const uint8_t* const _data, uint32_t _s
 
     tp_split_messages_t split_messages;
 
-    if (_size < VSOMEIP_MAX_UDP_MESSAGE_SIZE) {
-        VSOMEIP_ERROR_P << "Called with size: " << _size;
+    // A message is split because it exceeds one datagram: either the UDP limit
+    // or, with DTLS, the smaller record limit. Splitting needs a payload larger
+    // than one segment and a usable segment length (multiple of 16).
+    if (_size <= VSOMEIP_FULL_HEADER_SIZE + _max_segment_length || _max_segment_length == 0 || _max_segment_length % 16 != 0) {
+        VSOMEIP_ERROR_P << "Called with size: " << _size << ", max segment length: " << _max_segment_length;
         return split_messages;
     }
 

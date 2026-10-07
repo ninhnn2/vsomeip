@@ -112,6 +112,7 @@ private:
     bool use_dtls() const;
     std::string dtls_peer_key(const endpoint_type& _peer) const;
     bool send_queued_dtls_unlocked(const target_data_iterator_type _it);
+    void send_records_unlocked(std::vector<dtls_session::datagram_t>&& _records, const endpoint_type& _target);
     void feed_dtls_unicast(const message_buffer_t& _unicast_recv_buffer, size_t _bytes);
 
     auto shared_ptr() { return std::shared_ptr<udp_server_endpoint_impl>(shared_from_this(), this); }

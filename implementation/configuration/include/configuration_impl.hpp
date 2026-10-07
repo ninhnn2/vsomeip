@@ -249,6 +249,7 @@ public:
     VSOMEIP_EXPORT const std::string& get_dtls_psk_identity() const override;
     VSOMEIP_EXPORT const std::string& get_dtls_psk() const override;
     VSOMEIP_EXPORT const std::string& get_dtls_cipher() const override;
+    VSOMEIP_EXPORT const std::string& get_dtls_accelerator() const override;
     VSOMEIP_EXPORT bool get_dtls_peer_credentials(const std::string& _address, std::string& _identity,
                                                   std::string& _psk) const override;
     VSOMEIP_EXPORT std::string get_dtls_psk_for_identity(const std::string& _identity) const override;
@@ -651,6 +652,7 @@ protected:
     std::string dtls_psk_identity_;
     std::string dtls_psk_;
     std::string dtls_cipher_;
+    std::string dtls_accelerator_;
     // Per-peer keys: address -> (identity, key) for outgoing sessions, and
     // identity -> key for incoming ones. One compromised ECU then only exposes
     // the links it is part of.

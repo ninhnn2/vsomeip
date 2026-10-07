@@ -116,9 +116,17 @@ its own HSM, so only a CSR ever leaves the ECU.
 
 ## Key storage
 
-`private-key` accepts either a PEM file or, with the OpenSSL backend, an OpenSSL
-store URI (the wolfSSL backend reads PEM files only). A URI is passed
-to `OSSL_STORE_open()` unchanged, so with a PKCS#11 provider installed
+`private-key` accepts either a PEM file or a PKCS#11 URI.
+
+With the **wolfSSL backend** the URI names the library and the PIN file itself
+(RFC 7512), and the token is opened and logged in once per process:
+
+```json
+"private-key": "pkcs11:token=vsomeip-dtls;object=dtls-identity;type=private?module-path=/usr/lib/libckteec.so.0&pin-source=file:/etc/dtls/token.pin"
+```
+
+With the **OpenSSL backend** the URI is passed to `OSSL_STORE_open()` unchanged,
+so with a PKCS#11 provider installed
 
 ```json
 "private-key": "pkcs11:token=ecu-identity;object=dtls-identity;type=private"

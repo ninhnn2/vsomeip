@@ -17,14 +17,18 @@
 //   X509_VERIFY_PARAM host pin      wolfSSL_check_domain_name (SAN only)
 //   OSSL_STORE (file or pkcs11:)    PEM file only
 
+#include "../include/dtls_record_limit.hpp"
 #include "../include/dtls_session.hpp"
+#include "../include/dtls_wolfssl_device.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <exception>
+#include <iterator>
 #include <mutex>
 
 #include <boost/asio/error.hpp>
@@ -55,10 +59,15 @@ namespace {
 // Handshake flights are split at this size, like the OpenSSL backend, so a
 // certificate chain never needs IP fragmentation.
 constexpr unsigned short HANDSHAKE_MTU = 1200U;
-// After the handshake wolfSSL also limits each application record to the MTU.
-// A SOME/IP message is at most 1416 bytes and must stay one record in one
-// datagram: 1416 + 37 = 1453 (AES-GCM), 1445 (ChaCha20), up to 1485 (CBC).
-constexpr unsigned short DATA_MTU = 1500U;
+// Largest plaintext of one TLS/DTLS record (RFC 6347 4.1.1: 2^14).
+constexpr std::size_t MAX_RECORD_PLAINTEXT = 16384U;
+// After the handshake wolfSSL also limits each application record to the MTU:
+// one datagram, never IP-fragmented (dtls::DATAGRAM_SIZE). A SOME/IP datagram is
+// at most 1416 bytes, which fits with AES-GCM (1435) or ChaCha20 (1443), but a
+// CBC-SHA256 record carries at most 1407 bytes. The UDP endpoints know that
+// limit (dtls::max_message_size) and send larger messages as SOME/IP-TP
+// segments; anything still too large is refused by write().
+constexpr unsigned short DATA_MTU = static_cast<unsigned short>(dtls::DATAGRAM_SIZE);
 // A flight resent only because the peer resent its own goes out at most this
 // often; the retransmit timer (1 s, doubling) is not limited.
 constexpr auto RESEND_INTERVAL = std::chrono::milliseconds(1000);
@@ -166,6 +175,72 @@ dtls_session* session_of(WOLFSSL* _ssl) {
     return _ssl ? static_cast<dtls_session*>(wolfSSL_GetIOReadCtx(_ssl)) : nullptr;
 }
 
+// VSOMEIP_DTLS_STATS=<seconds>: every <seconds>, log where the records' time went,
+// summed over all sessions of the process. Off (the default) it costs one test.
+//   send     wolfSSL_write: encrypt + MAC of one outgoing record
+//   receive  datagram -> plaintext: MAC check + decrypt (wolfSSL_read loop)
+//   SA2UL    CIOCCRYPT ioctl, included in send/receive when "accelerator": "sa2ul"
+const long g_stats_period_s = [] {
+    const char* its_value = std::getenv("VSOMEIP_DTLS_STATS");
+    return its_value ? std::strtol(its_value, nullptr, 10) : 0L;
+}();
+
+struct stats_t {
+    std::atomic<std::uint64_t> sent_{0}, send_ns_{0}, send_cpu_ns_{0};
+    std::atomic<std::uint64_t> received_{0}, receive_ns_{0}, receive_cpu_ns_{0};
+    std::atomic<std::int64_t> last_report_ns_{0};
+    std::atomic<std::uint64_t> sa2ul_calls_{0}, sa2ul_ns_{0}; // values at the last report
+};
+stats_t g_stats;
+
+bool stats_enabled() {
+    return g_stats_period_s > 0;
+}
+
+std::int64_t now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// CPU time of the calling thread: wall time minus this is time spent waiting
+// (for the CPU on a loaded board, or for the SA2UL's DMA).
+std::int64_t thread_cpu_ns() {
+    timespec its_time{};
+    ::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &its_time);
+    return static_cast<std::int64_t>(its_time.tv_sec) * 1000000000LL + its_time.tv_nsec;
+}
+
+double per_item_us(std::uint64_t _ns, std::uint64_t _count) {
+    return _count ? static_cast<double>(_ns) / static_cast<double>(_count) / 1000.0 : 0.0;
+}
+
+void report_stats() {
+    const std::int64_t its_now = now_ns();
+    std::int64_t its_last = g_stats.last_report_ns_.load();
+    if (its_last == 0) {
+        g_stats.last_report_ns_.compare_exchange_strong(its_last, its_now);
+        return;
+    }
+    if (its_now - its_last < g_stats_period_s * 1000000000LL || !g_stats.last_report_ns_.compare_exchange_strong(its_last, its_now)) {
+        return;
+    }
+    const auto sent = g_stats.sent_.exchange(0), send_ns = g_stats.send_ns_.exchange(0);
+    const auto send_cpu_ns = g_stats.send_cpu_ns_.exchange(0);
+    const auto received = g_stats.received_.exchange(0), receive_ns = g_stats.receive_ns_.exchange(0);
+    const auto receive_cpu_ns = g_stats.receive_cpu_ns_.exchange(0);
+    const auto calls_now = dtls_wolfssl::sa2ul_operations(), ns_now = dtls_wolfssl::sa2ul_nanoseconds();
+    const auto calls = calls_now - g_stats.sa2ul_calls_.exchange(calls_now), sa2ul_ns = ns_now - g_stats.sa2ul_ns_.exchange(ns_now);
+    char its_line[480];
+    std::snprintf(its_line, sizeof(its_line),
+                  "DTLS stats %.1f s: send %llu records %.1f us each (cpu %.1f) | receive %llu records %.1f us each (cpu %.1f)"
+                  " | SA2UL %llu calls %.1f us each (%.2f per record)",
+                  static_cast<double>(its_now - its_last) / 1e9, static_cast<unsigned long long>(sent), per_item_us(send_ns, sent),
+                  per_item_us(send_cpu_ns, sent), static_cast<unsigned long long>(received), per_item_us(receive_ns, received),
+                  per_item_us(receive_cpu_ns, received),
+                  static_cast<unsigned long long>(calls), per_item_us(sa2ul_ns, calls),
+                  (sent + received) ? static_cast<double>(calls) / static_cast<double>(sent + received) : 0.0);
+    VSOMEIP_INFO << its_line;
+}
+
 } // namespace
 
 std::shared_ptr<dtls_session> dtls_session::create(boost::asio::io_context& _io, bool _is_client, credentials _credentials,
@@ -183,7 +258,8 @@ std::shared_ptr<dtls_session> dtls_session::create(boost::asio::io_context& _io,
 dtls_session::dtls_session(boost::asio::io_context& _io, bool _is_client, credentials _credentials, send_handler_t _send,
                            plaintext_handler_t _receive) :
     retransmit_timer_(_io), is_client_(_is_client), identity_(std::move(_credentials.identity_)),
-    resolver_(std::move(_credentials.resolver_)), cipher_(std::move(_credentials.cipher_)), auth_(_credentials.auth_),
+    resolver_(std::move(_credentials.resolver_)), cipher_(std::move(_credentials.cipher_)),
+    accelerator_(std::move(_credentials.accelerator_)), auth_(_credentials.auth_),
     certificate_(std::move(_credentials.certificate_)), private_key_(std::move(_credentials.private_key_)),
     ca_(std::move(_credentials.ca_)), peer_name_(std::move(_credentials.peer_name_)),
     peer_address_(std::move(_credentials.peer_address_)), time_floor_(_credentials.time_floor_), send_(std::move(_send)),
@@ -230,6 +306,10 @@ bool dtls_session::initialize() {
     }
     if (wolfSSL_CTX_set_cipher_list(context_, cipher_.c_str()) != WOLFSSL_SUCCESS) {
         VSOMEIP_ERROR << "DTLS: cipher \"" << cipher_ << "\" is unavailable in this wolfSSL build";
+        is_failed_ = true;
+        return false;
+    }
+    if (!attach_device()) {
         is_failed_ = true;
         return false;
     }
@@ -288,6 +368,56 @@ bool dtls_session::initialize() {
     return true;
 }
 
+bool dtls_session::attach_device() {
+    dtls_wolfssl::pkcs11_uri its_uri;
+    dtls_wolfssl::device_request its_request;
+    its_request.sa2ul_ = accelerator_ == "sa2ul";
+    if (auth_ == dtls_auth_e::CERTIFICATE && private_key_.rfind("pkcs11:", 0) == 0) {
+        std::string its_reason;
+        if (!dtls_wolfssl::parse_pkcs11_uri(private_key_, its_uri, its_reason)) {
+            VSOMEIP_ERROR << "DTLS: private key " << private_key_ << ": " << its_reason;
+            return false;
+        }
+        its_request.key_ = &its_uri;
+    }
+    if (!its_request.sa2ul_ && !its_request.key_) {
+        return true;
+    }
+
+    dtls_wolfssl::device its_device;
+    std::string its_reason;
+    if (!dtls_wolfssl::acquire_device(its_request, its_device, its_reason)) {
+        // Only a missing token key gets here: without it there is no identity.
+        VSOMEIP_ERROR << "DTLS: " << its_reason;
+        return false;
+    }
+    if (its_request.sa2ul_) {
+        // Said once per process: every session would report the same.
+        static std::once_flag its_reported;
+        // CBC suites are not always named so: ECDHE-ECDSA-AES128-SHA256 is CBC.
+        const bool its_cbc = cipher_.find("AES") != std::string::npos && cipher_.find("GCM") == std::string::npos
+                && cipher_.find("CCM") == std::string::npos;
+        std::call_once(its_reported, [&its_device, &its_reason, its_cbc, this]() {
+            if (!its_device.sa2ul_) {
+                VSOMEIP_WARNING << "DTLS: SA2UL accelerator unavailable (" << its_reason << "); AES runs on the CPU";
+            } else if (!its_cbc) {
+                VSOMEIP_WARNING << "DTLS: the SA2UL accelerates AES-CBC only; cipher " << cipher_ << " runs on the CPU";
+            }
+        });
+    }
+    if (its_device.id_ != INVALID_DEVID) {
+        if (wolfSSL_CTX_SetDevId(context_, its_device.id_) != WOLFSSL_SUCCESS) {
+            VSOMEIP_ERROR << "DTLS: cannot attach the crypto device to the wolfSSL context";
+            return false;
+        }
+        device_id_ = its_device.id_;
+    }
+    if (its_request.key_) {
+        key_label_ = its_uri.object_;
+    }
+    return true;
+}
+
 bool dtls_session::initialize_psk() {
     const bool its_identity_ok = is_client_ ? (!identity_.empty() && identity_.size() < 128U) : static_cast<bool>(resolver_);
     if (!its_identity_ok) {
@@ -313,14 +443,14 @@ bool dtls_session::initialize_certificate() {
         return false;
     }
 
-    // A "file:" URI names a plain PEM file. Other store URIs (pkcs11:) need the
-    // OpenSSL backend with pkcs11-provider; refuse them instead of guessing.
+    // A "file:" URI names a plain PEM file; "pkcs11:" a key in a token, which
+    // attach_device() has already opened. Other store URIs are refused.
     std::string its_key = private_key_;
     if (its_key.rfind("file:", 0) == 0) {
         its_key.erase(0, 5);
-    } else if (its_key.find(':') != std::string::npos && its_key.find('/') > its_key.find(':')) {
+    } else if (key_label_.empty() && its_key.find(':') != std::string::npos && its_key.find('/') > its_key.find(':')) {
         VSOMEIP_ERROR << "DTLS: private key URI " << private_key_
-                      << " is not supported by the wolfSSL backend (PEM file or file: only)";
+                      << " is not supported by the wolfSSL backend (PEM file, file: or pkcs11:)";
         return false;
     }
 
@@ -329,14 +459,24 @@ bool dtls_session::initialize_certificate() {
         VSOMEIP_ERROR << "DTLS: cannot load certificate chain " << certificate_ << ": " << error_text(its_result);
         return false;
     }
-    its_result = wolfSSL_CTX_use_PrivateKey_file(context_, its_key.c_str(), WOLFSSL_FILETYPE_PEM);
-    if (its_result != WOLFSSL_SUCCESS) {
-        VSOMEIP_ERROR << "DTLS: cannot load private key " << private_key_ << ": " << error_text(its_result);
-        return false;
-    }
-    if (wolfSSL_CTX_check_private_key(context_) != WOLFSSL_SUCCESS) {
-        VSOMEIP_ERROR << "DTLS: private key does not match certificate " << certificate_;
-        return false;
+    if (!key_label_.empty()) {
+        // The key never leaves the token: wolfSSL only keeps its label and asks
+        // the device to sign. No key/certificate match check here, it would
+        // cost a token signature per session; the CSR was signed by this key.
+        if (wolfSSL_CTX_use_PrivateKey_Label(context_, key_label_.c_str(), device_id_) != WOLFSSL_SUCCESS) {
+            VSOMEIP_ERROR << "DTLS: cannot use key \"" << key_label_ << "\" of the token";
+            return false;
+        }
+    } else {
+        its_result = wolfSSL_CTX_use_PrivateKey_file(context_, its_key.c_str(), WOLFSSL_FILETYPE_PEM);
+        if (its_result != WOLFSSL_SUCCESS) {
+            VSOMEIP_ERROR << "DTLS: cannot load private key " << private_key_ << ": " << error_text(its_result);
+            return false;
+        }
+        if (wolfSSL_CTX_check_private_key(context_) != WOLFSSL_SUCCESS) {
+            VSOMEIP_ERROR << "DTLS: private key does not match certificate " << certificate_;
+            return false;
+        }
     }
     // Untrusted clock (an ECU without RTC boots at 1970): wolfSSL compares validity with
     // "now" and calls every certificate "not yet valid". verify_certificate()
@@ -440,6 +580,14 @@ void dtls_session::start() {
 }
 
 void dtls_session::feed(const std::uint8_t* _data, std::size_t _size) {
+    std::vector<datagram_t> plaintext;
+    feed(_data, _size, plaintext);
+    for (auto& message : plaintext) {
+        receive_(std::move(message));
+    }
+}
+
+void dtls_session::feed(const std::uint8_t* _data, std::size_t _size, std::vector<datagram_t>& _plaintext) {
     if (!_data || _size == 0U) {
         return;
     }
@@ -451,7 +599,15 @@ void dtls_session::feed(const std::uint8_t* _data, std::size_t _size) {
             return;
         }
         incoming_.emplace_back(_data, _data + _size);
+        const bool its_timed = stats_enabled() && is_ready_;
+        const std::int64_t its_start = its_timed ? now_ns() : 0;
+        const std::int64_t its_cpu_start = its_timed ? thread_cpu_ns() : 0;
         drive_locked(outgoing, plaintext);
+        if (its_timed && !plaintext.empty()) {
+            g_stats.receive_ns_ += static_cast<std::uint64_t>(now_ns() - its_start);
+            g_stats.receive_cpu_ns_ += static_cast<std::uint64_t>(thread_cpu_ns() - its_cpu_start);
+            g_stats.received_ += plaintext.size();
+        }
         if (!outgoing.empty() && is_resend_locked(outgoing)) {
             const auto its_now = std::chrono::steady_clock::now();
             if (its_now - last_resend_ < RESEND_INTERVAL) {
@@ -462,7 +618,17 @@ void dtls_session::feed(const std::uint8_t* _data, std::size_t _size) {
         }
         note_sent_locked(outgoing);
     }
-    flush(std::move(outgoing), std::move(plaintext));
+    flush(std::move(outgoing), {});
+    if (!plaintext.empty()) {
+        if (stats_enabled()) {
+            report_stats();
+        }
+        if (_plaintext.empty()) {
+            _plaintext = std::move(plaintext);
+        } else {
+            std::move(plaintext.begin(), plaintext.end(), std::back_inserter(_plaintext));
+        }
+    }
 }
 
 // True when every record is a handshake message or ChangeCipherSpec that was
@@ -521,36 +687,70 @@ bool dtls_session::write(const std::uint8_t* _data, std::size_t _size, send_comp
         return false;
     }
     std::vector<datagram_t> outgoing;
-    std::vector<datagram_t> plaintext;
     bool result = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!is_ready_ || is_failed_) {
             return false;
         }
-        // One SOME/IP message must stay one record: wolfSSL would otherwise
-        // split it silently across records and the receiver would parse halves.
-        const int its_max = wolfSSL_GetMaxOutputSize(ssl_);
-        if (its_max > 0 && _size > static_cast<std::size_t>(its_max)) {
-            VSOMEIP_ERROR << "DTLS: message of " << _size << " bytes exceeds one record (" << its_max << " bytes)";
-            return false;
-        }
-        const int its_written = wolfSSL_write(ssl_, _data, static_cast<int>(_size));
-        result = its_written == static_cast<int>(_size);
-        if (!result) {
-            const int error = wolfSSL_get_error(ssl_, its_written);
-            if (error != WOLFSSL_ERROR_WANT_READ && error != WOLFSSL_ERROR_WANT_WRITE) {
-                is_failed_ = true;
-                VSOMEIP_ERROR << "DTLS: write failed: " << error_text(error);
-            }
-        }
-        while (!outgoing_.empty()) {
-            outgoing.emplace_back(std::move(outgoing_.front()));
-            outgoing_.pop_front();
-        }
-        arm_retransmit_locked();
+        result = write_locked(_data, _size, outgoing);
     }
-    flush(std::move(outgoing), std::move(plaintext), std::move(_completion));
+    flush(std::move(outgoing), {}, std::move(_completion));
+    return result;
+}
+
+bool dtls_session::seal(const std::uint8_t* _data, std::size_t _size, std::vector<datagram_t>& _records) {
+    if (!_data || _size == 0U) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!is_ready_ || is_failed_) {
+        return false;
+    }
+    return write_locked(_data, _size, _records);
+}
+
+bool dtls_session::write_locked(const std::uint8_t* _data, std::size_t _size, std::vector<datagram_t>& _records) {
+    // One SOME/IP message is one record in one datagram. wolfSSL refuses a
+    // message whose record would exceed DATA_MTU (DTLS_SIZE_ERROR) instead
+    // of splitting it; that drops this message only, the session stays.
+    // (wolfSSL_GetMaxOutputSize() assumes worst-case CBC padding and would
+    // refuse messages that do fit, so the exact check is left to the write.)
+    const std::int64_t its_start = stats_enabled() ? now_ns() : 0;
+    const std::int64_t its_cpu_start = its_start != 0 ? thread_cpu_ns() : 0;
+    const int its_written = wolfSSL_write(ssl_, _data, static_cast<int>(_size));
+    const bool result = its_written == static_cast<int>(_size);
+    if (result && its_start != 0) {
+        g_stats.send_ns_ += static_cast<std::uint64_t>(now_ns() - its_start);
+        g_stats.send_cpu_ns_ += static_cast<std::uint64_t>(thread_cpu_ns() - its_cpu_start);
+        ++g_stats.sent_;
+    }
+    if (!result) {
+        const int error = wolfSSL_get_error(ssl_, its_written);
+        if (error == DTLS_SIZE_ERROR) {
+            static std::atomic<std::int64_t> its_last_s{0};
+            const auto its_now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                           std::chrono::steady_clock::now().time_since_epoch())
+                                           .count();
+            if (its_last_s.exchange(its_now_s) != its_now_s) {
+                // The endpoints already segment such messages for methods with
+                // SOME/IP-TP, so this one belongs to a method without it.
+                const char* its_cipher = wolfSSL_get_cipher_name(ssl_);
+                VSOMEIP_ERROR << "DTLS: dropped a message of " << _size << " bytes: one " << DATA_MTU
+                              << "-byte datagram with " << its_cipher << " carries at most "
+                              << dtls::max_record_payload(its_cipher ? its_cipher : "")
+                              << "; enable SOME/IP-TP for this method or keep its messages smaller";
+            }
+        } else if (error != WOLFSSL_ERROR_WANT_READ && error != WOLFSSL_ERROR_WANT_WRITE) {
+            is_failed_ = true;
+            VSOMEIP_ERROR << "DTLS: write failed: " << error_text(error);
+        }
+    }
+    while (!outgoing_.empty()) {
+        _records.emplace_back(std::move(outgoing_.front()));
+        outgoing_.pop_front();
+    }
+    arm_retransmit_locked();
     return result;
 }
 
@@ -589,12 +789,13 @@ void dtls_session::drive_locked(std::vector<datagram_t>& _outgoing, std::vector<
     }
 
     if (is_ready_ && !is_failed_) {
+        if (read_buffer_.size() < MAX_RECORD_PLAINTEXT) {
+            read_buffer_.resize(MAX_RECORD_PLAINTEXT);
+        }
         for (;;) {
-            datagram_t plaintext(65536U);
-            const int received = wolfSSL_read(ssl_, plaintext.data(), static_cast<int>(plaintext.size()));
+            const int received = wolfSSL_read(ssl_, read_buffer_.data(), static_cast<int>(read_buffer_.size()));
             if (received > 0) {
-                plaintext.resize(static_cast<std::size_t>(received));
-                _plaintext.emplace_back(std::move(plaintext));
+                _plaintext.emplace_back(read_buffer_.begin(), read_buffer_.begin() + received);
                 continue;
             }
             const int error = wolfSSL_get_error(ssl_, received);

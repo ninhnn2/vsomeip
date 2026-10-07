@@ -4287,6 +4287,10 @@ void configuration_impl::load_someip_tp_for_service(const std::shared_ptr<servic
             method_t its_method(0);
             uint16_t its_max_segment_length(VSOMEIP_TP_MAX_SEGMENT_LENGTH_DEFAULT);
             uint32_t its_separation_time(0);
+            // "separation-time-us" (microseconds) wins over "separation-time" (ms):
+            // a receiver that drops line-rate bursts needs gaps of tens of us, and
+            // 1 ms per segment would cost ~0.2 s for a 256 KiB message.
+            bool has_separation_us(false);
 
             const std::string its_value(method.second.data());
             if (its_value.empty()) {
@@ -4314,9 +4318,15 @@ void configuration_impl::load_someip_tp_for_service(const std::shared_ptr<servic
                                 its_max_segment_length = uint16_t(its_max_segment_length - its_rest);
                             }
                         } else if (its_data.first == "separation-time") {
+                            if (!has_separation_us) {
+                                its_converter << std::dec << its_value_inner;
+                                its_converter >> its_separation_time;
+                                its_separation_time *= uint32_t(1000);
+                            }
+                        } else if (its_data.first == "separation-time-us") {
                             its_converter << std::dec << its_value_inner;
                             its_converter >> its_separation_time;
-                            its_separation_time *= uint32_t(1000);
+                            has_separation_us = true;
                         }
                     }
                     its_converter.str("");
@@ -4461,6 +4471,16 @@ void configuration_impl::load_dtls(const configuration_element& _element) {
     try {
         const bool enabled = settings->get<bool>("enable", false);
         const std::string its_mode = settings->get<std::string>("mode", "psk");
+        // "accelerator": "none" (default) or "sa2ul". Performance only: if the
+        // engine is missing at run time the session uses the CPU and says so.
+        dtls_accelerator_ = settings->get<std::string>("accelerator", "none");
+        if (dtls_accelerator_ == "none") {
+            dtls_accelerator_.clear();
+        } else if (dtls_accelerator_ != "sa2ul") {
+            VSOMEIP_ERROR << "DTLS accelerator must be \"none\" or \"sa2ul\", got \"" << dtls_accelerator_ << "\"";
+            its_fail();
+            return;
+        }
         if (its_mode == "certificate") {
             dtls_cipher_ = settings->get<std::string>("cipher", VSOMEIP_DTLS_DEFAULT_CERT_CIPHER);
             if (!load_dtls_certificate(*settings, _element.name_)) {
@@ -4648,6 +4668,10 @@ std::string configuration_impl::get_dtls_peer_name(const std::string& _address) 
 
 const std::string& configuration_impl::get_dtls_cipher() const {
     return dtls_cipher_;
+}
+
+const std::string& configuration_impl::get_dtls_accelerator() const {
+    return dtls_accelerator_;
 }
 
 bool configuration_impl::get_dtls_peer_credentials(const std::string& _address, std::string& _identity, std::string& _psk) const {

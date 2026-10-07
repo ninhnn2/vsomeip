@@ -62,6 +62,7 @@ private:
     // DTLS is used for unicast service endpoints only; SD and multicast stay plaintext.
     bool use_dtls() const;
     void send_queued_dtls(std::pair<message_buffer_ptr_t, uint32_t>& _entry);
+    void send_records_unlocked(std::vector<dtls_session::datagram_t>&& _records);
     void handle_dtls_datagram(boost::system::error_code const& _error, size_t _bytes, std::shared_ptr<message_buffer_t> _recv_buffer);
     void resume_dtls_queue();
     std::string get_address_port_remote() const;

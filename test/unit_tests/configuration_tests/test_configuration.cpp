@@ -1082,3 +1082,35 @@ TEST_F(test_configuration_impl, runtime_policy_update_does_not_leak_across_apps)
     its_config->load_security_policies(its_pm_app3);
     EXPECT_FALSE(its_pm_app3.is_client_allowed(&its_client, 0x4321, 0x0001, 0x0001));
 }
+
+// SOME/IP-TP separation time: "separation-time" is in milliseconds,
+// "separation-time-us" in microseconds and wins whatever the key order.
+TEST_F(test_configuration_impl, tp_separation_time_accepts_microseconds) {
+    scratch_config_dir dir;
+    dir.write("vsomeip_std.json", R"({
+        "routing": { "host": { "name": "routingmanager" } },
+        "applications": [ { "name": "routingmanager", "id": "0x1111" } ],
+        "services": [ {
+            "service": "0x1234", "instance": "0x5678", "unicast": "192.0.2.2", "unreliable": "30509",
+            "someip-tp": { "client-to-service": [
+                { "method": "0x0421", "max-segment-length": "1376", "separation-time": "2" },
+                { "method": "0x0422", "max-segment-length": "1376", "separation-time-us": "30" },
+                { "method": "0x0423", "separation-time": "5", "separation-time-us": "40" },
+                { "method": "0x0424", "separation-time-us": "40", "separation-time": "5" }
+            ] }
+        } ]
+    })");
+
+    auto its_config = load(dir, "routingmanager");
+
+    const auto separation = [&its_config](vsomeip_v3::method_t _method) {
+        uint16_t its_segment(0);
+        uint32_t its_separation(0);
+        its_config->get_tp_configuration(0x1234, 0x5678, _method, true, its_segment, its_separation);
+        return its_separation;
+    };
+    EXPECT_EQ(separation(0x0421), 2000U);
+    EXPECT_EQ(separation(0x0422), 30U);
+    EXPECT_EQ(separation(0x0423), 40U);
+    EXPECT_EQ(separation(0x0424), 40U);
+}

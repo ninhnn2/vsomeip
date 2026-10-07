@@ -83,7 +83,8 @@ the same for both, and the two interoperate on the wire.
 | Library | OpenSSL 3 (`find_package(OpenSSL)`) | wolfSSL 5.9 (`find_package(wolfssl CONFIG)`) |
 | PSK suites | `PSK-AES128-GCM-SHA256`, `ECDHE-PSK-CHACHA20-POLY1305` | the same, plus `ECDHE-PSK-AES128-GCM-SHA256` (RFC 8442) |
 | Certificate suites | `ECDHE-ECDSA-AES128-GCM-SHA256` and others | the same |
-| Private key | PEM file, or an OSSL_STORE URI (`pkcs11:` → TEE) | PEM file (`file:` prefix accepted); `pkcs11:` is refused |
+| Private key | PEM file, or an OSSL_STORE URI (`pkcs11:` → TEE) through pkcs11-provider | PEM file (`file:` accepted), or an RFC 7512 `pkcs11:` URI with `module-path` and `pin-source`; the token is logged in once per process |
+| Crypto accelerator | — (CPU; the devcrypto engine can be loaded through `OPENSSL_CONF`) | `"accelerator": "sa2ul"`: AES-CBC records on the TI SA2UL through `/dev/crypto` |
 | HelloVerifyRequest | certificate mode | always (DTLS 1.2 server default) |
 | Licence | Apache-2.0 | GPLv3, or commercial from wolfSSL Inc. |
 
@@ -100,6 +101,7 @@ and its user changes struct layouts without any other symptom:
 ```sh
 ./configure --enable-dtls --enable-psk --enable-dtls-mtu --enable-opensslextra \
     --enable-curve25519 --enable-supportedcurves --enable-sp --enable-sp-asm --enable-armasm \
+    --enable-cryptocb --enable-cryptocbutils=free --enable-pkcs11 \
     CFLAGS="-DWOLFSSL_ALWAYS_VERIFY_CB -DWOLFSSL_HOSTNAME_VERIFY_ALT_NAME_ONLY -DWOLFSSL_STATIC_PSK"
 ```
 
@@ -108,11 +110,13 @@ and its user changes struct layouts without any other symptom:
 
 | Option | Why |
 |---|---|
-| `--enable-dtls-mtu` | Handshake flights are cut at 1200 bytes, then the MTU is raised to 1500 so a 1416-byte SOME/IP message stays one record in one datagram (wolfSSL limits each record to the MTU) |
+| `--enable-dtls-mtu` | Handshake flights are cut at 1200 bytes, then the MTU is raised to 1472 (one Ethernet frame minus IPv4 and UDP headers), so a SOME/IP message is one record in one datagram and never IP-fragmented (wolfSSL limits each record to the MTU) |
 | `--enable-opensslextra` | X.509 accessors for the time-floor expiry check |
 | `WOLFSSL_ALWAYS_VERIFY_CB` | The verify callback sees every certificate: time floor, rejection reason |
 | `WOLFSSL_HOSTNAME_VERIFY_ALT_NAME_ONLY` | The pinned peer name must be in the SAN, never only in the CN |
 | `WOLFSSL_STATIC_PSK` | Plain PSK suites, including the default `PSK-AES128-GCM-SHA256`; wolfSSL builds only (EC)DHE-PSK otherwise |
+| `--enable-cryptocb --enable-cryptocbutils=free` | Optional. The vsomeip crypto device: SA2UL offload, and the free hook that closes the cryptodev session of an AES key |
+| `--enable-pkcs11` | Optional. Private keys in a PKCS#11 token (OP-TEE, TrustKernel, HSM) |
 
 wolfSSL-specific behaviour handled in `dtls_session_wolfssl.cpp`:
 
@@ -140,7 +144,117 @@ For a cross-build, provide the chosen library's headers and libraries for the ta
 architecture (SDK sysroot or install prefix) before running CMake. OpenSSL is usually
 part of the target image; wolfSSL has to be shipped with the application.
 
+### Hardware: SA2UL accelerator and PKCS#11 keys (wolfSSL backend)
+
+The wolfSSL backend registers one wolfSSL crypto-callback device per process
+(`dtls_wolfssl_device.cpp`) and attaches it to the sessions that need it. Everything the
+device does not handle falls back to wolfSSL's own CPU code.
+
+- **`"accelerator": "sa2ul"`** sends AES-CBC record encryption to the TI SA2UL/SA3UL
+  through cryptodev (`/dev/crypto`). At start the device opens a probe session and reads
+  which kernel driver serves `cbc(aes)`; anything other than `*-sa2ul` disables the
+  offload with a warning instead of routing AES through a syscall to the CPU. One
+  cryptodev session per AES key is kept until wolfSSL frees the key. Requests of 64 KiB
+  or more stay on the CPU (the SA2UL driver would hand them back anyway).
+  Only the AES-CBC part of a CBC suite is offloaded (`PSK-AES128-CBC-SHA256`,
+  `ECDHE-PSK-AES128-CBC-SHA256`, `ECDHE-ECDSA-AES128-CBC-SHA256`): the SA2UL drivers
+  in the TI SDK kernels checked (6.6 and 6.12) register no GCM, and HMAC through
+  cryptodev falls back to the CPU. With a GCM suite the option has no effect and says so.
+  A CBC-SHA256 record holds less than a plain UDP datagram (1407 against 1416 bytes);
+  see [Message size](#message-size-and-someip-tp) for how the endpoints handle that.
+  The option is a performance choice, not a security one: without a usable SA2UL the
+  session runs AES on the CPU and logs why.
+- **`pkcs11:` private key**: `private-key` takes an RFC 7512 URI,
+  `pkcs11:token=<token>;object=<label>;type=private?module-path=<lib>&pin-source=file:<pin file>`.
+  The PIN file must not be accessible by group or others; a PIN in the URI
+  (`pin-value`) is refused. The token is opened and logged in once per process; only
+  ECDSA signatures with that key go to the token, ephemeral ECDHE keys and peer
+  signature checks stay on the CPU. A missing module, token or PIN is an error: the
+  session is not created.
+
 ### Unit test
+
+### Message size and SOME/IP-TP
+
+One SOME/IP datagram is sent as one DTLS record in one UDP datagram of at most 1472
+bytes (Ethernet 1500 - IPv4 20 - UDP 8), so DTLS never causes IP fragmentation. How much
+SOME/IP fits in that record depends on the cipher suite:
+
+| Suite | Largest SOME/IP datagram per record | Fits 1416 (payload 1400)? |
+|---|---:|---|
+| AES-GCM, AES-CCM | 1435 | yes |
+| AES-CCM8, ChaCha20-Poly1305 | 1443 | yes |
+| AES-CBC with SHA-1 | 1407 (encrypt-then-MAC; 1419 without) | no |
+| AES-CBC with SHA-256 (all suites the SA2UL runs) | **1407** | no |
+| AES-CBC with SHA-384 | 1391 | no |
+
+`dtls::max_message_size()` (`dtls_record_limit.cpp`) computes this for the configured
+`cipher` list, taking the smallest value of all suites in the list so the result holds
+whichever one the handshake picks. Each UDP endpoint that uses DTLS keeps it as its
+send limit and logs it once:
+
+```
+DTLS: one record holds at most 1407 bytes of SOME/IP with ECDHE-ECDSA-AES128-SHA256; larger messages use SOME/IP-TP where it is configured
+```
+
+- **Methods with `someip-tp`:** a message above the record limit is segmented even
+  when it is not above the UDP limit (1416). This closes the gap of 1392-1400 byte
+  payloads with CBC-SHA256, which previously fit UDP, were not segmented and were then
+  refused by DTLS. `max-segment-length` is lowered when needed so that every segment
+  fits one record (1376 for CBC-SHA256 and CBC-SHA1, 1360 for CBC-SHA384; a warning
+  names the change once).
+- **Methods without `someip-tp`:** unchanged. A message above the record limit is
+  dropped (wolfSSL) with an error naming the method's fix: enable SOME/IP-TP for it or
+  keep its messages smaller. The session continues.
+- **Trains (nPDU batching):** several small messages are packed into one datagram only
+  up to the record limit, so batching never builds a datagram DTLS has to refuse.
+- **Receiving** is not affected: received datagrams are still checked against 1416,
+  whatever suite the peer negotiated.
+
+With AES-GCM or ChaCha20 nothing changes, since every SOME/IP datagram fits one record.
+
+### Endpoint data path
+
+After the handshake the UDP endpoints treat a DTLS record like a plaintext datagram:
+
+- **Send:** `send_queued_dtls_unlocked()` (server) / `send_queued_dtls()` (client) call
+  `dtls_session::seal()`, which encrypts the SOME/IP datagram and returns the record. The
+  endpoint puts it on its socket itself, and the send completion calls `send_cbk()` directly,
+  one io_context hop as on the plaintext path. Before, the record went through the session's
+  send handler, a post (the caller holds the socket lock), `async_send_to` and a second post
+  to `send_cbk()`.
+- **Receive:** `dtls_session::feed(datagram, plaintext_out)` returns the authenticated
+  messages, and the endpoint parses them in the same receive context (server: io_context,
+  client: its strand), handing the buffer on without another copy. Before, the plaintext
+  handler posted to the io_context and copied the message again.
+- `wolfSSL_read()` reads into a buffer the session keeps (16 KiB, one record's maximum
+  plaintext), instead of allocating and zeroing 64 KiB twice per record.
+- Handshake flights, alerts and retransmissions still go out through the send handler.
+  Errors keep their contract: a message `seal()` refuses (record limit, failed session) is
+  reported to `send_cbk()` as a failed send.
+
+Measured on an AM62A (A53, loaded), old and new build alternately: RTT -3 to -8 % and
+board CPU per request -3 to -7 % in every DTLS mode, plaintext unchanged. Context switches
+per request did not change, so the hops were cheap on a busy io thread; most of the cost per
+message is vsomeip itself.
+
+### Where the time goes: VSOMEIP_DTLS_STATS
+
+`VSOMEIP_DTLS_STATS=<seconds>` (wolfSSL backend) logs, every `<seconds>`, the cost of the
+records of all sessions of the process. It is off by default and then costs one test per
+record:
+
+```
+DTLS stats 1.0 s: send 750 records 133.4 us each (cpu 112.5) | receive 749 records 97.2 us each (cpu 85.8) + deliver 10.8 us | SA2UL 0 calls 0.0 us each (0.00 per record)
+```
+
+| Field | Meaning |
+|---|---|
+| send | `wolfSSL_write()` of one record: encryption and MAC, plus the SA2UL when it is used |
+| receive | from datagram to plaintext: MAC check and decryption |
+| (cpu ...) | CPU time of the thread in that step; wall time minus CPU time is waiting (for the CPU on a loaded node, or for the SA2UL's DMA) |
+| deliver | handing the plaintext to the endpoint (queued to its io_context) |
+| SA2UL | `CIOCCRYPT` calls and their duration; one call per record |
 
 `test/unit_tests/dtls_session_tests` runs a client and a server `dtls_session` against
 each other in one process, through queues the test controls, against whichever backend
@@ -148,8 +262,10 @@ the library was built with (`-DGTEST_ROOT=...`, target `unit_tests_dtls_session_
 It covers the PSK and certificate handshakes, the 1416-byte single-record limit, loss and
 retransmission of every flight, replayed, tampered and garbage records, the cookie, and
 every certificate rejection, including the untrusted-clock rules and the case of a
-clock years behind the certificates. The same 33 cases pass
-on both backends on x86_64 and with wolfSSL on an aarch64 target whose clock is at 1970.
+clock years behind the certificates, and the record limit of every suite against the
+TLS library itself (a message of the limit fits one 1472-byte datagram; with wolfSSL
+one byte more is refused). On x86_64, 41 cases pass with OpenSSL and 43 with wolfSSL
+(one more, the SA2UL interoperability case, needs the hardware and is skipped).
 
 ## Scope and limitations
 

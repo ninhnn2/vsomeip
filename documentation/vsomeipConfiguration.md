@@ -726,6 +726,10 @@ Both peers need this object with the same identity and key. See
   be stored next to the configuration: the command can read it from a keyring, an HSM or
   a trusted application. It runs once, while the configuration is loaded, in the working
   directory of the process.
+- **accelerator** - `none` (default) or `sa2ul`: with the wolfSSL backend, AES-CBC
+  record encryption runs on the TI SA2UL through `/dev/crypto`. It only applies to CBC
+  suites; when the SA2UL is not usable the session runs on the CPU and logs why. The
+  OpenSSL backend ignores it with a warning. Valid in PSK and certificate mode.
 - **cipher** - OpenSSL cipher string. The default `PSK-AES128-GCM-SHA256` has no forward
   secrecy: whoever obtains the key can decrypt traffic recorded earlier.
   `ECDHE-PSK-CHACHA20-POLY1305` adds an ephemeral key exchange and is the only AEAD
@@ -784,8 +788,10 @@ address. See [DTLS with X.509 certificates](dtls-certificate.md) for the design.
 - **private-key** - PEM file with the private key of `certificate`, mode `0600` (a looser
   file is refused), or an OpenSSL store URI such as `pkcs11:token=ecu;object=dtls`. A URI
   is handed to OpenSSL unchanged, so a key held in an HSM is used through the PKCS#11
-  provider without leaving it. Store URIs need the OpenSSL backend; the wolfSSL backend
-  accepts a PEM file (optionally as `file:<path>`) and refuses any other URI.
+  provider without leaving it. The wolfSSL backend accepts a PEM file (optionally as
+  `file:<path>`) or an RFC 7512 URI that also names the library and the PIN file:
+  `pkcs11:token=vsomeip-dtls;object=dtls-identity;type=private?module-path=/usr/lib/libckteec.so.0&pin-source=file:/etc/dtls/token.pin`
+  (PIN file mode `0600`; `pin-value` is refused).
 - **ca** - PEM file with the trust anchors. Only its integrity matters; protect it like
   the binaries (read-only, verified rootfs).
 - **cipher** - Defaults to `ECDHE-ECDSA-AES128-GCM-SHA256`: forward secrecy, ECDSA
@@ -1203,11 +1209,13 @@ Debounce time for requests to the service on 192.168.1.9 should have a:
         - **service-to-client** (array) - Contains the IDs for responses, fields and events which are sent from the node to a remote client which can be segmented via SOME/IP-TP if they exceed the maximum message size for UDP communication. If an ID isn't listed here the message will otherwise be dropped if the maximum message size is exceeded.
             - **method** - configures the method id to use
             - **max-segment-length** - new UDP payload in bytes, value must be a multiple of 16.
-            - **separation-time** - lower limit used between sending of two segments of the same SOME/IP-TP message. Default for the separation time is 0, no matter whether a message is SOME/IP-TP or not. For separation time 0, message sending is no different from what it was before.
+            - **separation-time** - lower limit in milliseconds used between sending of two segments of the same SOME/IP-TP message. Default for the separation time is 0, no matter whether a message is SOME/IP-TP or not. For separation time 0, message sending is no different from what it was before.
+            - **separation-time-us** - the same lower limit in microseconds; takes precedence over `separation-time`. Use it when a receiver drops back-to-back segments (an embedded Ethernet switch or NIC whose receive FIFO overflows at line rate) and a whole millisecond per segment would be too slow: a gap of a few tens of microseconds already avoids the loss.
         - **client-to-service** (array) - Contains the IDs for requests, which are sent from the node to a remote service which can be segmented via SOME/IP-TP if they exceed the maximum message size for UDP communication. If an ID isn't listed here the message will otherwise be dropped if the maximum message size is exceeded. Please note that the unicast key has to be set to the remote IP address of the offering node for this setting to take effect.
             - **method** - configures the method id to use
             - **max-segment-length** - new UDP payload in bytes, value must be a multiple of 16.
-            - **separation-time** - lower limit used between sending of two segments of the same SOME/IP-TP message. Default for the separation time is 0, no matter whether a message is SOME/IP-TP or not. For separation time 0, message sending is no different from what it was before.
+            - **separation-time** - lower limit in milliseconds used between sending of two segments of the same SOME/IP-TP message. Default for the separation time is 0, no matter whether a message is SOME/IP-TP or not. For separation time 0, message sending is no different from what it was before.
+            - **separation-time-us** - the same lower limit in microseconds; takes precedence over `separation-time`. Use it when a receiver drops back-to-back segments (an embedded Ethernet switch or NIC whose receive FIFO overflows at line rate) and a whole millisecond per segment would be too slow: a gap of a few tens of microseconds already avoids the loss.
 
 <details><summary>Services configuration</summary>
 

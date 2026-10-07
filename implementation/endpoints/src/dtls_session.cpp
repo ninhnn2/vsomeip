@@ -6,6 +6,7 @@
 #include "../include/dtls_session.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -133,7 +134,8 @@ std::shared_ptr<dtls_session> dtls_session::create(boost::asio::io_context& _io,
 dtls_session::dtls_session(boost::asio::io_context& _io, bool _is_client, credentials _credentials, send_handler_t _send,
                            plaintext_handler_t _receive) :
     retransmit_timer_(_io), is_client_(_is_client), identity_(std::move(_credentials.identity_)),
-    resolver_(std::move(_credentials.resolver_)), cipher_(std::move(_credentials.cipher_)), auth_(_credentials.auth_),
+    resolver_(std::move(_credentials.resolver_)), cipher_(std::move(_credentials.cipher_)),
+    accelerator_(std::move(_credentials.accelerator_)), auth_(_credentials.auth_),
     certificate_(std::move(_credentials.certificate_)), private_key_(std::move(_credentials.private_key_)),
     ca_(std::move(_credentials.ca_)), peer_name_(std::move(_credentials.peer_name_)),
     peer_address_(std::move(_credentials.peer_address_)), time_floor_(_credentials.time_floor_), send_(std::move(_send)),
@@ -183,6 +185,13 @@ bool dtls_session::initialize() {
         VSOMEIP_ERROR << "DTLS: invalid PSK configuration (identity or key)";
         is_failed_ = true;
         return false;
+    }
+    if (!accelerator_.empty()) {
+        static std::once_flag its_reported;
+        std::call_once(its_reported, [this]() {
+            VSOMEIP_WARNING << "DTLS: accelerator \"" << accelerator_ << "\" is supported by the wolfSSL backend only;"
+                            << " the OpenSSL backend runs AES on the CPU (or through its devcrypto engine)";
+        });
     }
     context_ = SSL_CTX_new(DTLS_method());
     if (!context_) {
@@ -385,6 +394,14 @@ void dtls_session::start() {
 }
 
 void dtls_session::feed(const std::uint8_t* _data, std::size_t _size) {
+    std::vector<datagram_t> plaintext;
+    feed(_data, _size, plaintext);
+    for (auto& message : plaintext) {
+        receive_(std::move(message));
+    }
+}
+
+void dtls_session::feed(const std::uint8_t* _data, std::size_t _size, std::vector<datagram_t>& _plaintext) {
     if (!_data || _size == 0U) {
         return;
     }
@@ -398,7 +415,12 @@ void dtls_session::feed(const std::uint8_t* _data, std::size_t _size) {
         incoming_.emplace_back(_data, _data + _size);
         drive_locked(outgoing, plaintext);
     }
-    flush(std::move(outgoing), std::move(plaintext));
+    flush(std::move(outgoing), {});
+    if (_plaintext.empty()) {
+        _plaintext = std::move(plaintext);
+    } else {
+        std::move(plaintext.begin(), plaintext.end(), std::back_inserter(_plaintext));
+    }
 }
 
 bool dtls_session::write(const std::uint8_t* _data, std::size_t _size, send_completion_t _completion) {
@@ -406,29 +428,44 @@ bool dtls_session::write(const std::uint8_t* _data, std::size_t _size, send_comp
         return false;
     }
     std::vector<datagram_t> outgoing;
-    std::vector<datagram_t> plaintext;
     bool result = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!is_ready_ || is_failed_) {
             return false;
         }
-        std::size_t written = 0;
-        result = SSL_write_ex(ssl_, _data, _size, &written) == 1 && written == _size;
-        if (!result) {
-            const int error = SSL_get_error(ssl_, 0);
-            if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) {
-                is_failed_ = true;
-                VSOMEIP_ERROR << "DTLS: write failed";
-            }
-        }
-        while (!outgoing_.empty()) {
-            outgoing.emplace_back(std::move(outgoing_.front()));
-            outgoing_.pop_front();
-        }
-        arm_retransmit_locked();
+        result = write_locked(_data, _size, outgoing);
     }
-    flush(std::move(outgoing), std::move(plaintext), std::move(_completion));
+    flush(std::move(outgoing), {}, std::move(_completion));
+    return result;
+}
+
+bool dtls_session::seal(const std::uint8_t* _data, std::size_t _size, std::vector<datagram_t>& _records) {
+    if (!_data || _size == 0U) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!is_ready_ || is_failed_) {
+        return false;
+    }
+    return write_locked(_data, _size, _records);
+}
+
+bool dtls_session::write_locked(const std::uint8_t* _data, std::size_t _size, std::vector<datagram_t>& _records) {
+    std::size_t written = 0;
+    const bool result = SSL_write_ex(ssl_, _data, _size, &written) == 1 && written == _size;
+    if (!result) {
+        const int error = SSL_get_error(ssl_, 0);
+        if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) {
+            is_failed_ = true;
+            VSOMEIP_ERROR << "DTLS: write failed";
+        }
+    }
+    while (!outgoing_.empty()) {
+        _records.emplace_back(std::move(outgoing_.front()));
+        outgoing_.pop_front();
+    }
+    arm_retransmit_locked();
     return result;
 }
 

@@ -319,6 +319,12 @@ public:
         return empty;
     }
 
+    /// Crypto accelerator for the DTLS record layer: "" (CPU) or "sa2ul".
+    virtual const std::string& get_dtls_accelerator() const {
+        static const std::string empty;
+        return empty;
+    }
+
     /// Identity and key this node presents to _address, so each pair of ECUs can
     /// hold its own key. Falls back to the node-wide identity when no entry
     /// matches. Returns false when the peer is configured but has no usable key.

@@ -14,6 +14,8 @@
 #include <sstream>
 
 #include "../include/boardnet_endpoint_host.hpp"
+#include "../include/dtls_record_limit.hpp"
+#include "../include/tp.hpp"
 #include "../../routing/include/routing_host.hpp"
 #include "../include/endpoint_impl.hpp"
 #include "../../utility/include/utility.hpp"
@@ -58,6 +60,47 @@ uint32_t endpoint_impl<Protocol>::find_magic_cookie(byte_t* _buffer, size_t _siz
     } while (!is_found);
 
     return (is_found ? its_offset : 0xFFFFFFFF);
+}
+
+template<typename Protocol>
+void endpoint_impl<Protocol>::set_dtls_record_limit(const std::string& _cipher_list) {
+    dtls_record_limit_ = static_cast<uint32_t>(dtls::max_message_size(_cipher_list));
+    if (dtls_record_limit_ < max_message_size_) {
+        static std::atomic<bool> its_logged{false};
+        if (!its_logged.exchange(true)) {
+            VSOMEIP_INFO << "DTLS: one record holds at most " << dtls_record_limit_ << " bytes of SOME/IP with " << _cipher_list
+                         << "; larger messages use SOME/IP-TP where it is configured";
+        }
+    }
+}
+
+template<typename Protocol>
+uint32_t endpoint_impl<Protocol>::get_datagram_limit() const {
+    return (dtls_record_limit_ != 0 && dtls_record_limit_ < max_message_size_) ? dtls_record_limit_ : max_message_size_;
+}
+
+template<typename Protocol>
+bool endpoint_impl<Protocol>::exceeds_dtls_record(uint32_t _size) const {
+    return dtls_record_limit_ != 0 && _size > dtls_record_limit_;
+}
+
+template<typename Protocol>
+uint16_t endpoint_impl<Protocol>::fit_segment_length(uint16_t _configured) const {
+    if (dtls_record_limit_ == 0 || dtls_record_limit_ <= VSOMEIP_FULL_HEADER_SIZE + VSOMEIP_TP_HEADER_SIZE + 16U) {
+        return _configured;
+    }
+    // TP segment lengths are multiples of 16 (all but the last segment).
+    const uint32_t its_room = dtls_record_limit_ - VSOMEIP_FULL_HEADER_SIZE - VSOMEIP_TP_HEADER_SIZE;
+    const auto its_max = static_cast<uint16_t>(its_room - its_room % 16U);
+    if (_configured <= its_max) {
+        return _configured;
+    }
+    static std::atomic<bool> its_logged{false};
+    if (!its_logged.exchange(true)) {
+        VSOMEIP_WARNING << "DTLS: SOME/IP-TP max-segment-length " << _configured << " does not fit one DTLS record (at most "
+                        << dtls_record_limit_ << " bytes); sending segments of " << its_max;
+    }
+    return its_max;
 }
 
 template<typename Protocol>

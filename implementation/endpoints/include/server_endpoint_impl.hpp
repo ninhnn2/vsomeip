@@ -106,6 +106,8 @@ protected:
     virtual void print_status() = 0;
 
     bool check_message_size(uint32_t _size) const;
+    // The method of this serialized message has SOME/IP-TP configured.
+    bool tp_configured_for(const byte_t* const _data);
     // The caller must hold the `mutex_` lock
     typename endpoint_impl<Protocol>::cms_ret_e segment_message(const uint8_t* const _data, uint32_t _size, const endpoint_type& _target);
     // The caller must hold the `mutex_` lock
