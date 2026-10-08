@@ -12,6 +12,7 @@
 
 #include <vsomeip/defines.hpp>
 #include "client_endpoint_impl.hpp"
+#include "tls_stream.hpp"
 #if defined(__QNX__)
 #include "../../utility/include/qnx_helper.hpp"
 #endif
@@ -89,6 +90,27 @@ private:
     std::chrono::steady_clock::time_point connect_timepoint_;
 
     boost::asio::steady_timer sent_timer_;
+
+    // TLS ("tls" in the configuration): one session per TCP connection. The
+    // socket carries TLS records; the SOME/IP parser still works on recv_buffer_,
+    // which receives the decrypted stream.
+    bool use_tls() const;
+    void on_transport_connected() override;
+    void send_queued_tls(std::pair<message_buffer_ptr_t, uint32_t>& _entry);
+    void tls_receive_cbk(const boost::system::error_code& _error, size_t _bytes, const message_buffer_ptr_t& _recv_buffer,
+                         size_t _recv_buffer_size);
+    void resume_tls_queue();
+    std::shared_ptr<dtls_session> get_tls_session() const;
+
+    mutable std::mutex tls_mutex_;
+    std::shared_ptr<dtls_session> tls_session_;
+    std::shared_ptr<tls::writer> tls_writer_;
+    std::vector<byte_t> tls_raw_buffer_;  // ciphertext; read under socket_mutex_, used on strand_
+    // A peer that keeps refusing the handshake must not be hammered: TCP connects
+    // fine every time, so the normal reconnect backoff never grows. 100 ms, 200 ms, ... 30 s.
+    void tls_failed(const std::string& _what);
+    boost::asio::steady_timer tls_backoff_timer_;
+    std::uint32_t tls_failures_{0};  // on strand_
 };
 
 } // namespace vsomeip_v3

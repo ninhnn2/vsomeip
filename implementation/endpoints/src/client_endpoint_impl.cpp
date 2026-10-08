@@ -452,6 +452,7 @@ void client_endpoint_impl<Protocol>::connect_cbk(boost::system::error_code const
             }
             connect_timeout_ = VSOMEIP_DEFAULT_CONNECT_TIMEOUT; // TODO: use config variable
             reconnect_counter_ = 0;
+            on_transport_connected();
             {
                 std::scoped_lock its_lock(mutex_);
                 if (was_not_connected_) {

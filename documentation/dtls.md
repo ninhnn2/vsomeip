@@ -267,10 +267,45 @@ TLS library itself (a message of the limit fits one 1472-byte datagram; with wol
 one byte more is refused). On x86_64, 41 cases pass with OpenSSL and 43 with wolfSSL
 (one more, the SA2UL interoperability case, needs the hardware and is skipped).
 
+## TLS for reliable (TCP) endpoints
+
+With `"tls": { "enable": true }` the TCP service endpoints carry TLS (wolfSSL backend
+only; the OpenSSL backend refuses it and the connection is closed). The credentials are
+the ones of the `"dtls"` object (mode, certificate, key or `pkcs11:` URI, CA, peers,
+PSKs, accelerator); `"dtls": { "enable": false, ... }` keeps UDP in plaintext while TCP
+uses TLS. `"version"` is `"1.2"` (default, same cipher suites as DTLS, so the SA2UL can
+run AES-CBC) or `"1.3"` (`TLS13-AES128-GCM-SHA256` unless `"cipher"` says otherwise).
+
+```json
+"tls" : { "enable" : true, "version" : "1.2" }
+```
+
+- **Session:** the same `dtls_session` with `credentials::stream_` set: TLS method of the
+  configured version, no cookie, no MTU and no retransmission timer (TCP does that);
+  input and output are stream chunks, read partially as wolfSSL asks for bytes.
+- **Client** (`tcp_client_endpoint_impl`): once TCP is connected,
+  `on_transport_connected()` creates the session and sends the ClientHello. Messages
+  queued meanwhile wait and are sent when the handshake completes.
+- **Server** (`tcp_server_endpoint_impl::connection`): one session per accepted
+  connection, created before the first read; the expected certificate name is looked up
+  by the client's address. A connection whose session cannot be created is closed.
+- **Writes:** handshake data and records go through one ordered queue per connection
+  (`tls::writer`), since TLS records must reach the stream in order and a socket takes one
+  write at a time. A message larger than 16 KiB becomes several records, written as one
+  chunk.
+- **Reads:** ciphertext is read into its own buffer; the plaintext is appended to the
+  endpoint's receive buffer and the unchanged SOME/IP stream parser runs on it.
+- **Failures:** a refused handshake or a bad record ends the connection (a TLS stream
+  cannot skip a record); the endpoint reconnects. There is never a plaintext fallback:
+  with `"tls"` on, a connection without a ready session sends nothing.
+- Magic cookies are not used with TLS: the record layer already detects corruption.
+
 ## Scope and limitations
 
-- Protected: UDP unicast service data on configured service endpoints.
-- Not protected: SOME/IP Service Discovery, any other multicast traffic, and TCP.
+- Protected: UDP unicast service data on configured service endpoints; with `"tls"`, TCP
+  service data.
+- Not protected: SOME/IP Service Discovery and any other multicast traffic; TCP unless
+  `"tls"` is enabled.
 - Authentication: a PSK (node-wide, or one key per peer pair through `peers`), or X.509
   certificates with `"mode": "certificate"` — see [DTLS with X.509 certificates](dtls-certificate.md).
   Keys can come from a file, inline, or a `key-command`; certificate private keys also

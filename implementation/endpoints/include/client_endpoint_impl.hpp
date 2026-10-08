@@ -84,6 +84,9 @@ public:
 
 public:
     virtual void connect() = 0;
+    // Called once the transport connection is up, before queued messages are
+    // resumed and the host is told (TCP: starts the TLS handshake).
+    virtual void on_transport_connected() { }
     virtual void receive() = 0;
     virtual void print_status() = 0;
 

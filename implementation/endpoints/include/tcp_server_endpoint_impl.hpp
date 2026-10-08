@@ -14,6 +14,7 @@
 #include "auxiliary_context.hpp"
 
 #include "tcp_socket.hpp"
+#include "tls_stream.hpp"
 
 #include <chrono>
 
@@ -56,6 +57,9 @@ public:
     void receive();
     void print_status();
 
+    // TLS: the handshake with _remote finished; send what was queued meanwhile.
+    void resume_tls_sending(const endpoint_type& _remote);
+
 private:
     bool is_established_to_without_retry(const std::shared_ptr<endpoint_definition>& _endpoint);
     class connection : public std::enable_shared_from_this<connection> {
@@ -97,6 +101,17 @@ private:
                                           const std::chrono::steady_clock::time_point _start);
         void stop_and_remove_connection();
         void wait_until_sent(const boost::system::error_code& _error);
+
+        // TLS ("tls" in the configuration): one session per accepted connection.
+        // recv_buffer_ receives the decrypted stream, so the parser is unchanged.
+        bool start_tls();
+        void tls_receive_cbk(const boost::system::error_code& _error, size_t _bytes);
+        bool send_queued_tls(const target_data_iterator_type _it);
+        bool tls_enabled_{false};  // fixed at construction: never plaintext when set
+        std::mutex tls_mutex_;     // guards the two pointers (set once by start_tls)
+        std::shared_ptr<dtls_session> tls_session_;
+        std::shared_ptr<tls::writer> tls_writer_;
+        std::vector<byte_t> tls_raw_buffer_;
 
         std::mutex socket_mutex_;
         std::unique_ptr<tcp_socket> socket_;

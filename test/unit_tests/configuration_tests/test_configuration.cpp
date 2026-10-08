@@ -1114,3 +1114,42 @@ TEST_F(test_configuration_impl, tp_separation_time_accepts_microseconds) {
     EXPECT_EQ(separation(0x0423), 40U);
     EXPECT_EQ(separation(0x0424), 40U);
 }
+
+// "tls" switches TLS on for reliable endpoints; credentials come from "dtls".
+// A version other than 1.2/1.3 must not silently fall back to plaintext.
+TEST_F(test_configuration_impl, tls_block_enables_tls_and_fails_closed) {
+    {
+        scratch_config_dir dir;
+        dir.write("vsomeip_std.json", R"({
+            "routing": { "host": { "name": "routingmanager" } },
+            "applications": [ { "name": "routingmanager", "id": "0x1111" } ],
+            "dtls": { "enable": false, "psk-identity": "lab-peer",
+                      "psk-key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" },
+            "tls": { "enable": true, "version": "1.3", "cipher": "TLS13-AES128-GCM-SHA256" }
+        })");
+        auto its_config = load(dir, "routingmanager");
+        EXPECT_TRUE(its_config->is_tls_enabled());
+        EXPECT_FALSE(its_config->is_dtls_enabled()) << "TLS alone must not switch DTLS on";
+        EXPECT_EQ(its_config->get_tls_version(), "1.3");
+        EXPECT_EQ(its_config->get_tls_cipher(), "TLS13-AES128-GCM-SHA256");
+        EXPECT_EQ(its_config->get_dtls_psk_identity(), "lab-peer") << "credentials are read even with DTLS off";
+    }
+    {
+        scratch_config_dir dir;
+        dir.write("vsomeip_std.json", R"({
+            "routing": { "host": { "name": "routingmanager" } },
+            "applications": [ { "name": "routingmanager", "id": "0x1111" } ],
+            "tls": { "enable": false, "version": "1.1" }
+        })");
+        auto its_config = load(dir, "routingmanager");
+        EXPECT_TRUE(its_config->is_tls_enabled()) << "an invalid version keeps TLS on, so sessions refuse it";
+    }
+    {
+        scratch_config_dir dir;
+        dir.write("vsomeip_std.json", R"({
+            "routing": { "host": { "name": "routingmanager" } },
+            "applications": [ { "name": "routingmanager", "id": "0x1111" } ]
+        })");
+        EXPECT_FALSE(load(dir, "routingmanager")->is_tls_enabled());
+    }
+}

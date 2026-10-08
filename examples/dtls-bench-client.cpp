@@ -31,6 +31,8 @@
 //   --timeout-ms T  per-request response timeout (default 5000)
 //   --warmup W      requests excluded from the statistics (default 5)
 //   --label L       free text copied into the result line
+//   --reliable      send over TCP (the service must offer a reliable port);
+//                   with "tls" in the configuration that is TLS, otherwise plain TCP
 //
 // It also doubles as a traffic generator for a functional test:
 //
@@ -53,6 +55,7 @@ public:
         std::string label{"run"};
         std::uint32_t interval_ms{0};
         std::uint32_t progress_s{0};
+        bool reliable{false};
     };
 
     explicit bench_client(options _options) :
@@ -119,7 +122,7 @@ private:
             }
         }
 
-        auto its_request = vsomeip::runtime::get()->create_request(false); // false: UDP
+        auto its_request = vsomeip::runtime::get()->create_request(options_.reliable); // true: TCP
         its_request->set_service(BENCH_SERVICE_ID);
         its_request->set_instance(BENCH_INSTANCE_ID);
         its_request->set_method(method_);
@@ -298,6 +301,8 @@ int main(int argc, char** argv) {
             its_options.interval_ms = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         } else if (has_value("--progress-s")) {
             its_options.progress_s = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (std::strcmp(argv[i], "--reliable") == 0) {
+            its_options.reliable = true;
         }
     }
 

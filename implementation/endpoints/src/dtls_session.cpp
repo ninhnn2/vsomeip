@@ -121,6 +121,11 @@ bool cookie_for(const std::string& _peer, unsigned char* _out, std::size_t _out_
 
 std::shared_ptr<dtls_session> dtls_session::create(boost::asio::io_context& _io, bool _is_client, credentials _credentials,
                                                    send_handler_t _send, plaintext_handler_t _receive) {
+    if (_credentials.stream_) {
+        // TLS over TCP is implemented for the wolfSSL backend only.
+        VSOMEIP_ERROR << "TLS: reliable (TCP) endpoints need vsomeip built with VSOMEIP_DTLS_BACKEND=wolfssl";
+        return {};
+    }
     auto result = std::shared_ptr<dtls_session>(
             new dtls_session(_io, _is_client, std::move(_credentials), std::move(_send), std::move(_receive)));
     if (!result->initialize()) {

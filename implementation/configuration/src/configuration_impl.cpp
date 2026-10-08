@@ -198,6 +198,9 @@ configuration_impl::configuration_impl(const configuration_impl& _other) :
     dtls_enabled_ = _other.dtls_enabled_;
     dtls_psk_identity_ = _other.dtls_psk_identity_;
     dtls_psk_ = _other.dtls_psk_;
+    tls_enabled_ = _other.tls_enabled_;
+    tls_version_ = _other.tls_version_;
+    tls_cipher_ = _other.tls_cipher_;
 }
 
 configuration_impl::~configuration_impl() { }
@@ -631,6 +634,7 @@ bool configuration_impl::load_data(const std::vector<configuration_element>& _el
             load_tracing(e);
             load_udp_receive_buffer_size(e);
             load_dtls(e);
+            load_tls(e);
             load_services(e);
             load_request_debounce_time(e);
             load_dispatch_defaults(e);
@@ -4553,6 +4557,49 @@ void configuration_impl::load_dtls(const configuration_element& _element) {
         VSOMEIP_ERROR << "Invalid DTLS configuration: " << error.what();
         its_fail();
     }
+}
+
+void configuration_impl::load_tls(const configuration_element& _element) {
+    const auto settings = _element.tree_.get_child_optional("tls");
+    if (!settings) return;
+    // Like DTLS: a present but malformed object counts as enabled, so the
+    // endpoints fail closed instead of sending plaintext.
+    tls_enabled_ = true;
+    try {
+        tls_enabled_ = settings->get<bool>("enable", false);
+        tls_version_ = settings->get<std::string>("version", "1.2");
+        tls_cipher_ = settings->get<std::string>("cipher", "");
+    } catch (const std::exception& error) {
+        VSOMEIP_ERROR << "Invalid TLS configuration: " << error.what();
+        tls_enabled_ = true;
+        tls_version_ = "invalid";
+        return;
+    }
+    if (tls_version_ != "1.2" && tls_version_ != "1.3") {
+        VSOMEIP_ERROR << "TLS version must be \"1.2\" or \"1.3\", got \"" << tls_version_ << "\"";
+        tls_enabled_ = true;  // sessions refuse the version: fail closed
+    }
+    if (tls_enabled_) {
+        if (!_element.tree_.get_child_optional("dtls")) {
+            VSOMEIP_ERROR << "TLS needs the credentials of a \"dtls\" object; reliable endpoints will not connect";
+        }
+        VSOMEIP_WARNING << "TLS " << tls_version_ << " enabled for reliable (TCP) service endpoints, "
+                        << (dtls_certificate_mode_ ? "certificate" : "PSK") << " mode, cipher "
+                        << (tls_cipher_.empty() ? (tls_version_ == "1.3" ? std::string(VSOMEIP_TLS13_DEFAULT_CIPHER) : dtls_cipher_)
+                                                : tls_cipher_);
+    }
+}
+
+bool configuration_impl::is_tls_enabled() const {
+    return tls_enabled_;
+}
+
+const std::string& configuration_impl::get_tls_version() const {
+    return tls_version_;
+}
+
+const std::string& configuration_impl::get_tls_cipher() const {
+    return tls_cipher_;
 }
 
 bool configuration_impl::load_dtls_certificate(const boost::property_tree::ptree& _settings, const std::string& _config_path) {

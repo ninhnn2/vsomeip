@@ -264,8 +264,14 @@ dtls_session::dtls_session(boost::asio::io_context& _io, bool _is_client, creden
     ca_(std::move(_credentials.ca_)), peer_name_(std::move(_credentials.peer_name_)),
     peer_address_(std::move(_credentials.peer_address_)), time_floor_(_credentials.time_floor_), send_(std::move(_send)),
     receive_(std::move(_receive)) {
+    stream_ = _credentials.stream_;
+    tls_version_ = _credentials.tls_version_;
     if (cipher_.empty()) {
-        cipher_ = auth_ == dtls_auth_e::CERTIFICATE ? VSOMEIP_DTLS_DEFAULT_CERT_CIPHER : VSOMEIP_DTLS_DEFAULT_CIPHER;
+        if (stream_ && tls_version_ == "1.3") {
+            cipher_ = VSOMEIP_TLS13_DEFAULT_CIPHER;
+        } else {
+            cipher_ = auth_ == dtls_auth_e::CERTIFICATE ? VSOMEIP_DTLS_DEFAULT_CERT_CIPHER : VSOMEIP_DTLS_DEFAULT_CIPHER;
+        }
     }
     // A PSK server resolves the key once it knows which identity the client
     // claims, so it starts without one; a PSK client must carry its key.
@@ -291,21 +297,36 @@ dtls_session::~dtls_session() {
 
 bool dtls_session::initialize() {
     if (is_failed_ || !send_ || !receive_) {
-        VSOMEIP_ERROR << "DTLS: invalid PSK configuration (identity or key)";
+        VSOMEIP_ERROR << kind() << ": invalid PSK configuration (identity or key)";
         is_failed_ = true;
         return false;
     }
     ensure_library_initialized();
 
     // DTLS 1.2 only, like the OpenSSL backend, so both can talk to each other.
-    context_ = wolfSSL_CTX_new(is_client_ ? wolfDTLSv1_2_client_method() : wolfDTLSv1_2_server_method());
+    // TLS: exactly the version configured, no negotiation down.
+    WOLFSSL_METHOD* its_method = nullptr;
+    if (!stream_) {
+        its_method = is_client_ ? wolfDTLSv1_2_client_method() : wolfDTLSv1_2_server_method();
+    } else if (tls_version_ == "1.2") {
+        its_method = is_client_ ? wolfTLSv1_2_client_method() : wolfTLSv1_2_server_method();
+#if defined(WOLFSSL_TLS13)
+    } else if (tls_version_ == "1.3") {
+        its_method = is_client_ ? wolfTLSv1_3_client_method() : wolfTLSv1_3_server_method();
+#endif
+    } else {
+        VSOMEIP_ERROR << "TLS: version \"" << tls_version_ << "\" is not available (use \"1.2\" or \"1.3\")";
+        is_failed_ = true;
+        return false;
+    }
+    context_ = its_method ? wolfSSL_CTX_new(its_method) : nullptr;
     if (!context_) {
-        VSOMEIP_ERROR << "DTLS: failed to create wolfSSL context";
+        VSOMEIP_ERROR << kind() << ": failed to create wolfSSL context";
         is_failed_ = true;
         return false;
     }
     if (wolfSSL_CTX_set_cipher_list(context_, cipher_.c_str()) != WOLFSSL_SUCCESS) {
-        VSOMEIP_ERROR << "DTLS: cipher \"" << cipher_ << "\" is unavailable in this wolfSSL build";
+        VSOMEIP_ERROR << kind() << ": cipher \"" << cipher_ << "\" is unavailable in this wolfSSL build";
         is_failed_ = true;
         return false;
     }
@@ -329,17 +350,19 @@ bool dtls_session::initialize() {
 
     ssl_ = wolfSSL_new(context_);
     if (!ssl_) {
-        VSOMEIP_ERROR << "DTLS: failed to allocate wolfSSL session";
+        VSOMEIP_ERROR << kind() << ": failed to allocate wolfSSL session";
         is_failed_ = true;
         return false;
     }
     wolfSSL_SetIOReadCtx(ssl_, this);
     wolfSSL_SetIOWriteCtx(ssl_, this);
-    wolfSSL_dtls_set_using_nonblock(ssl_, 1);
-    if (wolfSSL_dtls_set_mtu(ssl_, HANDSHAKE_MTU) != WOLFSSL_SUCCESS) {
-        VSOMEIP_ERROR << "DTLS: cannot set the handshake MTU";
-        is_failed_ = true;
-        return false;
+    if (!stream_) {
+        wolfSSL_dtls_set_using_nonblock(ssl_, 1);
+        if (wolfSSL_dtls_set_mtu(ssl_, HANDSHAKE_MTU) != WOLFSSL_SUCCESS) {
+            VSOMEIP_ERROR << "DTLS: cannot set the handshake MTU";
+            is_failed_ = true;
+            return false;
+        }
     }
 
     if (auth_ == dtls_auth_e::CERTIFICATE) {
@@ -347,13 +370,13 @@ bool dtls_session::initialize() {
         // expected SAN name per peer address is what stops one ECU
         // impersonating another (SAN only: WOLFSSL_HOSTNAME_VERIFY_ALT_NAME_ONLY).
         if (wolfSSL_check_domain_name(ssl_, peer_name_.c_str()) != WOLFSSL_SUCCESS) {
-            VSOMEIP_ERROR << "DTLS: cannot pin the expected peer name";
+            VSOMEIP_ERROR << kind() << ": cannot pin the expected peer name";
             is_failed_ = true;
             return false;
         }
         wolfSSL_SetCertCbCtx(ssl_, this);
     }
-    if (!is_client_ && !peer_address_.empty()) {
+    if (!stream_ && !is_client_ && !peer_address_.empty()) {
         // wolfSSL always answers a first ClientHello with a HelloVerifyRequest.
         // Its cookie is an HMAC under a per-session secret over the peer
         // address it was given and the ClientHello, so give it the sender.
@@ -375,7 +398,7 @@ bool dtls_session::attach_device() {
     if (auth_ == dtls_auth_e::CERTIFICATE && private_key_.rfind("pkcs11:", 0) == 0) {
         std::string its_reason;
         if (!dtls_wolfssl::parse_pkcs11_uri(private_key_, its_uri, its_reason)) {
-            VSOMEIP_ERROR << "DTLS: private key " << private_key_ << ": " << its_reason;
+            VSOMEIP_ERROR << kind() << ": private key " << private_key_ << ": " << its_reason;
             return false;
         }
         its_request.key_ = &its_uri;
@@ -388,7 +411,7 @@ bool dtls_session::attach_device() {
     std::string its_reason;
     if (!dtls_wolfssl::acquire_device(its_request, its_device, its_reason)) {
         // Only a missing token key gets here: without it there is no identity.
-        VSOMEIP_ERROR << "DTLS: " << its_reason;
+        VSOMEIP_ERROR << kind() << ": " << its_reason;
         return false;
     }
     if (its_request.sa2ul_) {
@@ -399,15 +422,15 @@ bool dtls_session::attach_device() {
                 && cipher_.find("CCM") == std::string::npos;
         std::call_once(its_reported, [&its_device, &its_reason, its_cbc, this]() {
             if (!its_device.sa2ul_) {
-                VSOMEIP_WARNING << "DTLS: SA2UL accelerator unavailable (" << its_reason << "); AES runs on the CPU";
+                VSOMEIP_WARNING << kind() << ": SA2UL accelerator unavailable (" << its_reason << "); AES runs on the CPU";
             } else if (!its_cbc) {
-                VSOMEIP_WARNING << "DTLS: the SA2UL accelerates AES-CBC only; cipher " << cipher_ << " runs on the CPU";
+                VSOMEIP_WARNING << kind() << ": the SA2UL accelerates AES-CBC only; cipher " << cipher_ << " runs on the CPU";
             }
         });
     }
     if (its_device.id_ != INVALID_DEVID) {
         if (wolfSSL_CTX_SetDevId(context_, its_device.id_) != WOLFSSL_SUCCESS) {
-            VSOMEIP_ERROR << "DTLS: cannot attach the crypto device to the wolfSSL context";
+            VSOMEIP_ERROR << kind() << ": cannot attach the crypto device to the wolfSSL context";
             return false;
         }
         device_id_ = its_device.id_;
@@ -421,7 +444,7 @@ bool dtls_session::attach_device() {
 bool dtls_session::initialize_psk() {
     const bool its_identity_ok = is_client_ ? (!identity_.empty() && identity_.size() < 128U) : static_cast<bool>(resolver_);
     if (!its_identity_ok) {
-        VSOMEIP_ERROR << "DTLS: invalid PSK configuration (identity or key)";
+        VSOMEIP_ERROR << kind() << ": invalid PSK configuration (identity or key)";
         return false;
     }
     if (is_client_) {
@@ -434,12 +457,12 @@ bool dtls_session::initialize_psk() {
 
 bool dtls_session::initialize_certificate() {
     if (certificate_.empty() || private_key_.empty() || ca_.empty()) {
-        VSOMEIP_ERROR << "DTLS: certificate mode needs a certificate, a private key and a CA";
+        VSOMEIP_ERROR << kind() << ": certificate mode needs a certificate, a private key and a CA";
         return false;
     }
     if (peer_name_.empty()) {
         // Without an expected name any certificate of the CA would be accepted.
-        VSOMEIP_ERROR << "DTLS: no expected certificate name configured for peer " << peer_address_;
+        VSOMEIP_ERROR << kind() << ": no expected certificate name configured for peer " << peer_address_;
         return false;
     }
 
@@ -449,14 +472,14 @@ bool dtls_session::initialize_certificate() {
     if (its_key.rfind("file:", 0) == 0) {
         its_key.erase(0, 5);
     } else if (key_label_.empty() && its_key.find(':') != std::string::npos && its_key.find('/') > its_key.find(':')) {
-        VSOMEIP_ERROR << "DTLS: private key URI " << private_key_
+        VSOMEIP_ERROR << kind() << ": private key URI " << private_key_
                       << " is not supported by the wolfSSL backend (PEM file, file: or pkcs11:)";
         return false;
     }
 
     int its_result = wolfSSL_CTX_use_certificate_chain_file(context_, certificate_.c_str());
     if (its_result != WOLFSSL_SUCCESS) {
-        VSOMEIP_ERROR << "DTLS: cannot load certificate chain " << certificate_ << ": " << error_text(its_result);
+        VSOMEIP_ERROR << kind() << ": cannot load certificate chain " << certificate_ << ": " << error_text(its_result);
         return false;
     }
     if (!key_label_.empty()) {
@@ -464,17 +487,17 @@ bool dtls_session::initialize_certificate() {
         // the device to sign. No key/certificate match check here, it would
         // cost a token signature per session; the CSR was signed by this key.
         if (wolfSSL_CTX_use_PrivateKey_Label(context_, key_label_.c_str(), device_id_) != WOLFSSL_SUCCESS) {
-            VSOMEIP_ERROR << "DTLS: cannot use key \"" << key_label_ << "\" of the token";
+            VSOMEIP_ERROR << kind() << ": cannot use key \"" << key_label_ << "\" of the token";
             return false;
         }
     } else {
         its_result = wolfSSL_CTX_use_PrivateKey_file(context_, its_key.c_str(), WOLFSSL_FILETYPE_PEM);
         if (its_result != WOLFSSL_SUCCESS) {
-            VSOMEIP_ERROR << "DTLS: cannot load private key " << private_key_ << ": " << error_text(its_result);
+            VSOMEIP_ERROR << kind() << ": cannot load private key " << private_key_ << ": " << error_text(its_result);
             return false;
         }
         if (wolfSSL_CTX_check_private_key(context_) != WOLFSSL_SUCCESS) {
-            VSOMEIP_ERROR << "DTLS: private key does not match certificate " << certificate_;
+            VSOMEIP_ERROR << kind() << ": private key does not match certificate " << certificate_;
             return false;
         }
     }
@@ -486,7 +509,7 @@ bool dtls_session::initialize_certificate() {
         static std::once_flag its_reported;
         const auto its_floor = time_floor_;
         std::call_once(its_reported, [its_floor]() {
-            VSOMEIP_WARNING << "DTLS: system clock is before the time floor (" << its_floor
+            VSOMEIP_WARNING << "(D)TLS: system clock is before the time floor (" << its_floor
                             << "); certificate expiry is checked against the floor, not-before is not checked";
         });
     }
@@ -498,7 +521,7 @@ bool dtls_session::initialize_certificate() {
                                                       clock_untrusted_ ? WOLFSSL_LOAD_FLAG_DATE_ERR_OKAY
                                                                        : WOLFSSL_LOAD_VERIFY_DEFAULT_FLAGS);
     if (its_result != WOLFSSL_SUCCESS) {
-        VSOMEIP_ERROR << "DTLS: cannot load CA " << ca_ << ": " << error_text(its_result);
+        VSOMEIP_ERROR << kind() << ": cannot load CA " << ca_ << ": " << error_text(its_result);
         return false;
     }
 
@@ -531,7 +554,7 @@ void dtls_session::log_handshake_failure(int _ssl_error) {
     } else {
         its_reason = error_text(_ssl_error);
     }
-    VSOMEIP_WARNING << "DTLS: handshake failed (ssl error " << _ssl_error << "): " << its_reason
+    VSOMEIP_WARNING << kind() << ": handshake failed (ssl error " << _ssl_error << "): " << its_reason
                     << (its_folded ? " (+" + std::to_string(its_folded) + " similar in the last second)" : std::string());
 }
 
@@ -634,6 +657,9 @@ void dtls_session::feed(const std::uint8_t* _data, std::size_t _size, std::vecto
 // True when every record is a handshake message or ChangeCipherSpec that was
 // sent before. New flights, application data and alerts are never resends.
 bool dtls_session::is_resend_locked(const std::vector<datagram_t>& _outgoing) const {
+    if (stream_) {
+        return false;  // TCP retransmits; TLS never resends a flight
+    }
     bool its_any = false;
     for (const auto& its_datagram : _outgoing) {
         std::size_t its_offset = 0;
@@ -743,7 +769,7 @@ bool dtls_session::write_locked(const std::uint8_t* _data, std::size_t _size, st
             }
         } else if (error != WOLFSSL_ERROR_WANT_READ && error != WOLFSSL_ERROR_WANT_WRITE) {
             is_failed_ = true;
-            VSOMEIP_ERROR << "DTLS: write failed: " << error_text(error);
+            VSOMEIP_ERROR << kind() << ": write failed: " << error_text(error);
         }
     }
     while (!outgoing_.empty()) {
@@ -771,13 +797,15 @@ void dtls_session::drive_locked(std::vector<datagram_t>& _outgoing, std::vector<
             is_ready_ = true;
             // Handshake flights were split at 1200; application records may
             // now use the full datagram so one message stays one record.
-            wolfSSL_dtls_set_mtu(ssl_, DATA_MTU);
+            if (!stream_) {
+                wolfSSL_dtls_set_mtu(ssl_, DATA_MTU);
+            }
             if (auth_ == dtls_auth_e::CERTIFICATE) {
-                VSOMEIP_INFO << "DTLS: certificate handshake completed in " << handshake_ms() << " ms, peer " << peer_name_
-                             << ", cipher " << wolfSSL_get_cipher_name(ssl_) << " (wolfSSL)";
+                VSOMEIP_INFO << kind() << ": certificate handshake completed in " << handshake_ms() << " ms, peer " << peer_name_
+                             << ", cipher " << wolfSSL_get_cipher_name(ssl_) << " (wolfSSL, " << wolfSSL_get_version(ssl_) << ")";
             } else {
-                VSOMEIP_INFO << "DTLS: PSK handshake completed in " << handshake_ms() << " ms, cipher "
-                             << wolfSSL_get_cipher_name(ssl_) << " (wolfSSL)";
+                VSOMEIP_INFO << kind() << ": PSK handshake completed in " << handshake_ms() << " ms, cipher "
+                             << wolfSSL_get_cipher_name(ssl_) << " (wolfSSL, " << wolfSSL_get_version(ssl_) << ")";
             }
         } else {
             const int error = wolfSSL_get_error(ssl_, handshake_result);
@@ -803,7 +831,7 @@ void dtls_session::drive_locked(std::vector<datagram_t>& _outgoing, std::vector<
                 is_failed_ = true;
             } else if (error != WOLFSSL_ERROR_WANT_READ && error != WOLFSSL_ERROR_WANT_WRITE) {
                 is_failed_ = true;
-                VSOMEIP_WARNING << "DTLS: record authentication/decryption failed: " << error_text(error);
+                VSOMEIP_WARNING << kind() << ": record authentication/decryption failed: " << error_text(error);
             }
             break;
         }
@@ -843,9 +871,9 @@ void dtls_session::flush(std::vector<datagram_t>&& _outgoing, std::vector<datagr
 }
 
 void dtls_session::arm_retransmit_locked() {
-    // Only an unfinished handshake needs our timer. After it, wolfSSL resends
-    // its last flight by itself when the peer repeats its own.
-    if (!ssl_ || is_ready_ || is_failed_) {
+    // Only an unfinished DTLS handshake needs our timer. After it, wolfSSL resends
+    // its last flight by itself when the peer repeats its own. TLS: TCP resends.
+    if (!ssl_ || is_ready_ || is_failed_ || stream_) {
         boost::system::error_code ignored;
         retransmit_timer_.cancel(ignored);
         return;
@@ -948,6 +976,23 @@ int dtls_session::io_recv(WOLFSSL*, char* _buffer, int _size, void* _context) {
     }
     if (session->incoming_.empty()) {
         return WOLFSSL_CBIO_ERR_WANT_READ;
+    }
+    if (session->stream_) {
+        // A byte stream: hand out as much as asked for, across chunk boundaries.
+        std::size_t its_copied = 0;
+        while (its_copied < static_cast<std::size_t>(_size) && !session->incoming_.empty()) {
+            const datagram_t& its_chunk = session->incoming_.front();
+            const std::size_t its_left = its_chunk.size() - session->incoming_offset_;
+            const std::size_t its_take = std::min(its_left, static_cast<std::size_t>(_size) - its_copied);
+            std::memcpy(_buffer + its_copied, its_chunk.data() + session->incoming_offset_, its_take);
+            its_copied += its_take;
+            session->incoming_offset_ += its_take;
+            if (session->incoming_offset_ == its_chunk.size()) {
+                session->incoming_.pop_front();
+                session->incoming_offset_ = 0;
+            }
+        }
+        return static_cast<int>(its_copied);
     }
     datagram_t its_datagram = std::move(session->incoming_.front());
     session->incoming_.pop_front();

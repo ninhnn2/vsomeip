@@ -364,6 +364,23 @@ public:
     /// Certificate mode: seconds since the epoch below which the system clock
     /// is not trusted for certificate validity. 0 means the built-in default.
     virtual std::int64_t get_dtls_time_floor() const { return 0; }
+
+    /// TLS for reliable (TCP) service endpoints. It uses the credentials of the
+    /// "dtls" object (mode, certificate, key, CA, peers, accelerator); "tls" only
+    /// switches it on and chooses the version and, optionally, the cipher.
+    virtual bool is_tls_enabled() const { return false; }
+
+    /// "1.2" or "1.3".
+    virtual const std::string& get_tls_version() const {
+        static const std::string version{"1.2"};
+        return version;
+    }
+
+    /// Cipher list for TLS; empty means the DTLS cipher (TLS 1.2) or the TLS 1.3 default.
+    virtual const std::string& get_tls_cipher() const {
+        static const std::string empty;
+        return empty;
+    }
 };
 
 /// Inclusive port range.

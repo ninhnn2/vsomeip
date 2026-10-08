@@ -4,8 +4,11 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 #include <condition_variable>
+#include <cstring>
 #include <iomanip>
 #include <thread>
+
+#include <boost/asio/post.hpp>
 
 #include <boost/asio/write.hpp>
 
@@ -472,6 +475,7 @@ tcp_server_endpoint_impl::connection::connection(const std::weak_ptr<tcp_server_
     send_timeout_(_send_timeout), send_timeout_warning_(_send_timeout / 2) {
     if (auto its_server = _server.lock()) {
         instance_name_ = its_server->instance_name_;
+        tls_enabled_ = its_server->configuration_->is_tls_enabled();
     } else {
         instance_name_ = "";
     }
@@ -511,6 +515,11 @@ std::unique_lock<std::mutex> tcp_server_endpoint_impl::connection::get_socket_lo
 }
 
 void tcp_server_endpoint_impl::connection::start() {
+    if (tls_enabled_ && !start_tls()) {
+        // No downgrade: a connection that cannot be protected is closed.
+        stop_and_remove_connection();
+        return;
+    }
     receive();
 }
 
@@ -560,6 +569,17 @@ void tcp_server_endpoint_impl::connection::receive() {
             return;
         }
 
+        if (tls_enabled_) {
+            // Ciphertext to its own buffer; tls_receive_cbk() appends the plaintext
+            // to recv_buffer_ and runs the normal parser.
+            if (tls_raw_buffer_.size() < VSOMEIP_TLS_READ_SIZE) {
+                tls_raw_buffer_.resize(VSOMEIP_TLS_READ_SIZE);
+            }
+            socket_->async_receive(boost::asio::buffer(tls_raw_buffer_),
+                                   std::bind(&tcp_server_endpoint_impl::connection::tls_receive_cbk, shared_from_this(),
+                                             std::placeholders::_1, std::placeholders::_2));
+            return;
+        }
         socket_->async_receive(boost::asio::buffer(&recv_buffer_[recv_buffer_size_], left_buffer_size),
                                std::bind(&tcp_server_endpoint_impl::connection::receive_cbk, shared_from_this(), std::placeholders::_1,
                                          std::placeholders::_2));
@@ -585,6 +605,9 @@ void tcp_server_endpoint_impl::connection::stop() {
 
 bool tcp_server_endpoint_impl::connection::send_queued(const target_data_iterator_type _it) {
 
+    if (tls_enabled_) {
+        return send_queued_tls(_it);
+    }
     std::shared_ptr<tcp_server_endpoint_impl> its_server(server_.lock());
     if (!its_server) {
         VSOMEIP_ERROR_P << instance_name_ << "Couldn't lock server_";
@@ -1023,4 +1046,150 @@ void tcp_server_endpoint_impl::connection::wait_until_sent(const boost::system::
     }
     its_server->remove_connection(remote_, this);
 }
+void tcp_server_endpoint_impl::resume_tls_sending(const endpoint_type& _remote) {
+    std::scoped_lock its_lock(mutex_);
+    auto it = targets_.find(_remote);
+    if (it != targets_.end() && !it->second.is_sending_ && !it->second.queue_.empty()) {
+        (void)send_queued(it);
+    }
+}
+
+bool tcp_server_endpoint_impl::connection::start_tls() {
+    auto its_server = server_.lock();
+    if (!its_server) {
+        return false;
+    }
+    std::weak_ptr<connection> its_weak_self(shared_from_this());
+    boost::asio::io_context& its_io = its_server->io_;
+    auto its_writer = std::make_shared<tls::writer>([its_weak_self, &its_io](const tls::writer::buffer_t& _buffer, tls::writer::done_t _done) {
+        auto its_self = its_weak_self.lock();
+        bool its_started(false);
+        if (its_self) {
+            std::scoped_lock its_lock(its_self->socket_mutex_);
+            if (its_self->socket_->is_open()) {
+                its_self->socket_->async_write(std::vector<boost::asio::const_buffer>{boost::asio::buffer(*_buffer)},
+                                               [_buffer, _done](const boost::system::error_code& _error, std::size_t) { _done(_error); });
+                its_started = true;
+            }
+        }
+        if (!its_started) {
+            // Never call back inline: the caller may hold the server's mutex_.
+            boost::asio::post(its_io, [_done]() { _done(boost::asio::error::not_connected); });
+        }
+    });
+    dtls_session::credentials its_credentials;
+    if (!tls::make_credentials(its_server->configuration_, remote_address_.to_string(), false, its_credentials)) {
+        return false;
+    }
+    auto its_session = dtls_session::create(
+            its_io, false, std::move(its_credentials),
+            [its_writer](dtls_session::datagram_t _data, dtls_session::send_completion_t _completion) {
+                its_writer->push(std::move(_data), [_completion](const boost::system::error_code& _error) {
+                    if (_completion) {
+                        _completion(!_error);
+                    }
+                });
+            },
+            [](dtls_session::datagram_t) { });  // plaintext is taken from feed(..., out)
+    if (!its_session) {
+        VSOMEIP_ERROR_P << instance_name_ << "TLS: could not initialize the connection from " << get_address_port_remote();
+        return false;
+    }
+    std::scoped_lock its_lock(tls_mutex_);
+    tls_writer_ = its_writer;
+    tls_session_ = its_session;
+    return true;
+}
+
+void tcp_server_endpoint_impl::connection::tls_receive_cbk(const boost::system::error_code& _error, size_t _bytes) {
+    if (_error || _bytes == 0) {
+        receive_cbk(_error ? _error : boost::asio::error::eof, 0);  // stop, EOF, reset: the normal handling
+        return;
+    }
+    std::shared_ptr<dtls_session> its_session;
+    {
+        std::scoped_lock its_lock(tls_mutex_);
+        its_session = tls_session_;
+    }
+    if (!its_session) {
+        receive_cbk(boost::asio::error::connection_reset, 0);
+        return;
+    }
+    const bool was_ready = its_session->is_ready();
+    std::vector<dtls_session::datagram_t> its_plaintext;
+    its_session->feed(tls_raw_buffer_.data(), _bytes, its_plaintext);
+    if (its_session->is_failed()) {
+        // A TLS stream cannot skip a bad record (or a refused handshake): close it.
+        VSOMEIP_WARNING_P << instance_name_ << "TLS: session failed, closing the connection from " << get_address_port_remote();
+        receive_cbk(boost::asio::error::connection_reset, 0);
+        return;
+    }
+    if (!was_ready && its_session->is_ready()) {
+        if (auto its_server = server_.lock()) {
+            its_server->resume_tls_sending(remote_);
+        }
+    }
+    size_t its_total(0);
+    for (const auto& its_chunk : its_plaintext) {
+        its_total += its_chunk.size();
+    }
+    if (its_total == 0) {
+        receive();  // handshake data or a partial record
+        return;
+    }
+    {
+        std::scoped_lock its_lock(socket_mutex_);
+        if (recv_buffer_.size() < recv_buffer_size_ + its_total) {
+            recv_buffer_.resize(recv_buffer_size_ + its_total, 0x0);
+        }
+        size_t its_offset(recv_buffer_size_);
+        for (const auto& its_chunk : its_plaintext) {
+            std::memcpy(&recv_buffer_[its_offset], its_chunk.data(), its_chunk.size());
+            its_offset += its_chunk.size();
+        }
+    }
+    receive_cbk({}, its_total);
+}
+
+bool tcp_server_endpoint_impl::connection::send_queued_tls(const target_data_iterator_type _it) {
+    // The caller holds the server's mutex_.
+    std::shared_ptr<tcp_server_endpoint_impl> its_server(server_.lock());
+    if (!its_server) {
+        return false;
+    }
+    std::shared_ptr<dtls_session> its_session;
+    std::shared_ptr<tls::writer> its_writer;
+    {
+        std::scoped_lock its_lock(tls_mutex_);
+        its_session = tls_session_;
+        its_writer = tls_writer_;
+    }
+    if (!its_session || !its_writer || !its_session->is_ready()) {
+        // Handshake not finished (or not started): keep the entry queued;
+        // resume_tls_sending() sends it.
+        _it->second.is_sending_ = false;
+        return false;
+    }
+    message_buffer_ptr_t its_buffer = _it->second.queue_.front().first;
+    const endpoint_type its_remote = _it->first;
+    std::vector<dtls_session::datagram_t> its_records;
+    if (!its_session->seal(its_buffer->data(), its_buffer->size(), its_records) || its_records.empty()) {
+        _it->second.is_sending_ = false;
+        boost::asio::post(its_server->io_, [its_server, its_remote]() {
+            its_server->send_cbk(its_remote, boost::asio::error::operation_aborted, 0U);
+        });
+        return false;
+    }
+    // A large message becomes several records: write them as one stream chunk.
+    dtls_session::datagram_t its_stream = std::move(its_records.front());
+    for (size_t i = 1; i < its_records.size(); ++i) {
+        its_stream.insert(its_stream.end(), its_records[i].begin(), its_records[i].end());
+    }
+    _it->second.is_sending_ = true;
+    its_writer->push(std::move(its_stream), [its_server, its_buffer, its_remote](const boost::system::error_code& _error) {
+        its_server->send_cbk(its_remote, _error, _error ? 0U : its_buffer->size());
+    });
+    return true;
+}
+
 } // namespace vsomeip_v3

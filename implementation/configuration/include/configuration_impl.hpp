@@ -259,6 +259,9 @@ public:
     VSOMEIP_EXPORT const std::string& get_dtls_ca() const override;
     VSOMEIP_EXPORT std::string get_dtls_peer_name(const std::string& _address) const override;
     VSOMEIP_EXPORT std::int64_t get_dtls_time_floor() const override;
+    VSOMEIP_EXPORT bool is_tls_enabled() const override;
+    VSOMEIP_EXPORT const std::string& get_tls_version() const override;
+    VSOMEIP_EXPORT const std::string& get_tls_cipher() const override;
 
     VSOMEIP_EXPORT bool is_tp_client(service_t _service, instance_t _instance, method_t _method) const;
     VSOMEIP_EXPORT bool is_tp_service(service_t _service, instance_t _instance, method_t _method) const;
@@ -379,6 +382,7 @@ private:
     void load_activation_file_path(std::set<std::string>& _path, const boost::property_tree::ptree& _tree);
     void load_udp_receive_buffer_size(const configuration_element& _element);
     void load_dtls(const configuration_element& _element);
+    void load_tls(const configuration_element& _element);
     // Reads a key from "key", "key-file" or "key-command", in that order. The
     // command form keeps the key out of the file system: it can come from a
     // keyring, an HSM or an OP-TEE helper that prints it on stdout.
@@ -669,6 +673,9 @@ protected:
     std::string dtls_ca_;
     std::map<std::string, std::string> dtls_name_by_address_;
     std::int64_t dtls_time_floor_{0};
+    bool tls_enabled_{false};
+    std::string tls_version_{"1.2"};
+    std::string tls_cipher_;
 
     routing_state_e initial_routing_state_;
 

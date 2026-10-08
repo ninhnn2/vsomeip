@@ -220,13 +220,24 @@ protected:
             if (!to_server_.empty()) {
                 auto d = std::move(to_server_.front());
                 to_server_.pop_front();
-                server_->feed(d.data(), d.size());
+                deliver(server_, d);
             }
             if (!to_client_.empty()) {
                 auto d = std::move(to_client_.front());
                 to_client_.pop_front();
-                client_->feed(d.data(), d.size());
+                deliver(client_, d);
             }
+        }
+    }
+
+    // TLS over TCP: the stream may arrive in arbitrary pieces (stream_piece_ > 0).
+    void deliver(const std::shared_ptr<dtls_session>& _to, const datagram_t& _data) {
+        if (stream_piece_ == 0U) {
+            _to->feed(_data.data(), _data.size());
+            return;
+        }
+        for (std::size_t offset = 0; offset < _data.size(); offset += stream_piece_) {
+            _to->feed(_data.data() + offset, std::min(stream_piece_, _data.size() - offset));
         }
     }
 
@@ -273,7 +284,24 @@ protected:
     std::vector<datagram_t> received_by_client_;
     std::vector<datagram_t> received_by_server_;
     filter_t filter_;
+    std::size_t stream_piece_{0};
 };
+
+// TLS over TCP: same credentials, stream transport.
+dtls_session::credentials tls(dtls_session::credentials _credentials, const std::string& _version = "1.2") {
+    _credentials.stream_ = true;
+    _credentials.tls_version_ = _version;
+    return _credentials;
+}
+
+// A byte stream carries no message boundaries: compare the concatenation.
+datagram_t joined(const std::vector<datagram_t>& _chunks) {
+    datagram_t result;
+    for (const auto& chunk : _chunks) {
+        result.insert(result.end(), chunk.begin(), chunk.end());
+    }
+    return result;
+}
 
 #define REQUIRE_PKI()                                                                                                                      \
     if (!pki::get().ok()) {                                                                                                                \
@@ -1009,6 +1037,115 @@ TEST_F(dtls_session_test, sealed_records_keep_their_order_and_detect_tampering) 
     tampered.back() ^= 0x01U;
     server_->feed(tampered.data(), tampered.size(), none);
     EXPECT_TRUE(none.empty());
+}
+
+// ---------------------------------------------------------------- TLS (TCP)
+
+TEST_F(dtls_session_test, tls_is_refused_by_the_openssl_backend) {
+    if (is_wolfssl()) {
+        GTEST_SKIP() << "wolfSSL implements TLS streams";
+    }
+    EXPECT_FALSE(create(tls(psk_client()), tls(psk_server())));
+}
+
+TEST_F(dtls_session_test, tls12_certificate_carries_messages_both_ways) {
+    REQUIRE_PKI();
+    if (!is_wolfssl()) {
+        GTEST_SKIP() << "TLS streams need the wolfSSL backend";
+    }
+    auto client = tls(cert_side(true));
+    auto server = tls(cert_side(false));
+    client.cipher_ = server.cipher_ = "ECDHE-ECDSA-AES128-SHA256";  // the DTLS/SA2UL suite
+    ASSERT_TRUE(create(client, server));
+    ASSERT_TRUE(handshake());
+    for (std::size_t size : {1U, 64U, 1400U, 16384U, 70000U}) {
+        SCOPED_TRACE(size);
+        received_by_server_.clear();
+        received_by_client_.clear();
+        const auto up = message(size, 61);
+        ASSERT_TRUE(send(client_, up));
+        ASSERT_TRUE(run_until([this, &up] { return joined(received_by_server_).size() >= up.size(); }));
+        EXPECT_EQ(joined(received_by_server_), up);
+        const auto down = message(size, 62);
+        std::vector<datagram_t> records;
+        ASSERT_TRUE(server_->seal(down.data(), down.size(), records));
+        datagram_t stream = joined(records);
+        std::vector<datagram_t> plaintext;
+        client_->feed(stream.data(), stream.size(), plaintext);
+        EXPECT_EQ(joined(plaintext), down);
+    }
+}
+
+TEST_F(dtls_session_test, tls13_certificate_handshake_and_data) {
+    REQUIRE_PKI();
+    if (!is_wolfssl()) {
+        GTEST_SKIP() << "TLS streams need the wolfSSL backend";
+    }
+    ASSERT_TRUE(create(tls(cert_side(true), "1.3"), tls(cert_side(false), "1.3")));
+    ASSERT_TRUE(handshake());
+    const auto data = message(30000, 63);
+    ASSERT_TRUE(send(client_, data));
+    ASSERT_TRUE(run_until([this, &data] { return joined(received_by_server_).size() >= data.size(); }));
+    EXPECT_EQ(joined(received_by_server_), data);
+    ASSERT_TRUE(send(server_, data));
+    ASSERT_TRUE(run_until([this, &data] { return joined(received_by_client_).size() >= data.size(); }));
+    EXPECT_EQ(joined(received_by_client_), data);
+}
+
+TEST_F(dtls_session_test, tls_survives_a_stream_cut_into_small_pieces) {
+    REQUIRE_PKI();
+    if (!is_wolfssl()) {
+        GTEST_SKIP() << "TLS streams need the wolfSSL backend";
+    }
+    stream_piece_ = 7U;  // every record and handshake message split across many reads
+    ASSERT_TRUE(create(tls(cert_side(true)), tls(cert_side(false))));
+    ASSERT_TRUE(handshake());
+    const auto data = message(20000, 64);
+    ASSERT_TRUE(send(client_, data));
+    ASSERT_TRUE(run_until([this, &data] { return joined(received_by_server_).size() >= data.size(); }));
+    EXPECT_EQ(joined(received_by_server_), data);
+}
+
+TEST_F(dtls_session_test, tls_psk_carries_messages) {
+    if (!is_wolfssl()) {
+        GTEST_SKIP() << "TLS streams need the wolfSSL backend";
+    }
+    ASSERT_TRUE(create(tls(psk_client()), tls(psk_server())));
+    ASSERT_TRUE(handshake());
+    const auto data = message(5000, 65);
+    ASSERT_TRUE(send(client_, data));
+    ASSERT_TRUE(run_until([this, &data] { return joined(received_by_server_).size() >= data.size(); }));
+    EXPECT_EQ(joined(received_by_server_), data);
+}
+
+TEST_F(dtls_session_test, tls_refuses_the_wrong_peer_name) {
+    REQUIRE_PKI();
+    if (!is_wolfssl()) {
+        GTEST_SKIP() << "TLS streams need the wolfSSL backend";
+    }
+    auto client = tls(cert_side(true));
+    client.peer_name_ = "other.ecu.lab";
+    ASSERT_TRUE(create(client, tls(cert_side(false))));
+    EXPECT_TRUE(refused(client_));
+    EXPECT_TRUE(received_by_server_.empty());
+}
+
+TEST_F(dtls_session_test, tls_tampered_stream_fails_the_session) {
+    REQUIRE_PKI();
+    if (!is_wolfssl()) {
+        GTEST_SKIP() << "TLS streams need the wolfSSL backend";
+    }
+    ASSERT_TRUE(create(tls(cert_side(true)), tls(cert_side(false))));
+    ASSERT_TRUE(handshake());
+    const auto data = message(500, 66);
+    std::vector<datagram_t> records;
+    ASSERT_TRUE(client_->seal(data.data(), data.size(), records));
+    datagram_t stream = joined(records);
+    stream.back() ^= 0x01U;
+    std::vector<datagram_t> plaintext;
+    server_->feed(stream.data(), stream.size(), plaintext);
+    EXPECT_TRUE(plaintext.empty());
+    EXPECT_TRUE(server_->is_failed()) << "a TLS stream cannot skip a bad record: the connection must end";
 }
 
 } // namespace

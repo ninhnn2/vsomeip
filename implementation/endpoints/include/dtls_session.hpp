@@ -62,14 +62,19 @@ constexpr const char* VSOMEIP_DTLS_DEFAULT_CERT_CIPHER = "ECDHE-ECDSA-AES128-GCM
 // overridden with "time-floor" in the configuration. 2026-10-01T00:00:00Z.
 constexpr std::int64_t VSOMEIP_DTLS_DEFAULT_TIME_FLOOR = 1790812800;
 
+// TLS (reliable endpoints) when no "cipher" is given in "tls": TLS 1.2 uses the
+// DTLS cipher (same suites, same SA2UL offload), TLS 1.3 has its own names.
+constexpr const char* VSOMEIP_TLS13_DEFAULT_CIPHER = "TLS13-AES128-GCM-SHA256";
+
 // How a peer proves who it is.
 enum class dtls_auth_e : std::uint8_t {
     PSK,          // both peers hold the same symmetric key
     CERTIFICATE   // each peer holds its own private key and an X.509 chain to a common CA
 };
 
-// One DTLS association for one UDP peer. The endpoints own datagram routing;
-// this class owns the TLS library handshake, record protection and retransmit timer.
+// One DTLS association for one UDP peer, or (credentials::stream_) one TLS
+// connection over TCP. The endpoints own the sockets; this class owns the TLS
+// library handshake, record protection and, for DTLS, the retransmit timer.
 class dtls_session : public std::enable_shared_from_this<dtls_session> {
 public:
     using datagram_t = std::vector<std::uint8_t>;
@@ -98,6 +103,12 @@ public:
         std::string peer_name_;    // DNS name the peer certificate must carry in its SAN
         std::string peer_address_; // binds the server cookie to the sender address
         std::int64_t time_floor_{VSOMEIP_DTLS_DEFAULT_TIME_FLOOR};
+
+        // TLS over a byte stream (TCP) instead of DTLS over datagrams: no cookie,
+        // no MTU, no retransmission (TCP does that); data in and out are stream
+        // chunks, not records. wolfSSL backend only.
+        bool stream_{false};
+        std::string tls_version_{"1.2"};  // "1.2" or "1.3", stream only
     };
 
     static std::shared_ptr<dtls_session> create(boost::asio::io_context& _io, bool _is_client, credentials _credentials,
@@ -178,6 +189,12 @@ private:
     mutable std::mutex mutex_;
     boost::asio::steady_timer retransmit_timer_;
     bool is_client_;
+    // TLS over TCP (credentials::stream_): incoming_ holds stream chunks that
+    // io_recv() may consume partially, up to incoming_offset_ of the front one.
+    bool stream_{false};
+    std::string tls_version_;
+    std::size_t incoming_offset_{0};
+    const char* kind() const { return stream_ ? "TLS" : "DTLS"; }
     bool is_ready_{false};
     bool is_failed_{false};
     std::string identity_;

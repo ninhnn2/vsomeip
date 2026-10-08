@@ -810,6 +810,26 @@ answers a ClientHello with a stateless cookie first (RFC 6347 4.2.1), so a spoof
 cannot make it send its certificate flight to a victim.
 
 
+## TLS
+
+Optional TLS for reliable (TCP) service endpoints, wolfSSL backend only. It uses the
+credentials of the `dtls` object, which may have `"enable": false` to leave UDP in
+plaintext. See [TLS for reliable (TCP) endpoints](dtls.md#tls-for-reliable-tcp-endpoints).
+
+```json
+"tls" : {
+    "enable" : true,
+    "version" : "1.2"
+}
+```
+
+- **enable** - `true` protects every TCP service endpoint of this node. A connection that
+  cannot be protected is closed; it never falls back to plaintext.
+- **version** - `"1.2"` (default) or `"1.3"`. Any other value keeps TLS enabled and every
+  connection fails.
+- **cipher** - optional cipher list. Default: the `dtls` cipher for TLS 1.2,
+  `TLS13-AES128-GCM-SHA256` for TLS 1.3.
+
 ## Service Discovery
 
 - **service-discovery** - Contains settings related to the Service Discovery of the host application.
