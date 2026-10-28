@@ -467,7 +467,7 @@ bool udp_server_endpoint_impl::send_queued_dtls_unlocked(const target_data_itera
     // but nothing below may take `sync_` again.
 
     const auto its_entry = _it->second.queue_.front();
-    const auto its_session_it = dtls_sessions_.find(dtls_peer_key(_it->first));
+    const auto its_session_it = dtls_sessions_.find(_it->first);
     if (its_session_it == dtls_sessions_.end() || !its_session_it->second->is_ready()) {
         // No handshaked session for this peer yet - drop instead of falling back to
         // plaintext. The peer re-sends and the handshake completes on its datagrams.
@@ -665,7 +665,6 @@ void udp_server_endpoint_impl::feed_dtls_unicast(const message_buffer_t& _unicas
     // The caller shall not hold the lock
 
     const endpoint_type its_peer = unicast_remote_;
-    const std::string its_key = dtls_peer_key(its_peer);
 
     // A peer that restarted sends a fresh ClientHello from the same address and port.
     // An established session cannot consume it, so it has to be replaced - otherwise
@@ -680,7 +679,7 @@ void udp_server_endpoint_impl::feed_dtls_unicast(const message_buffer_t& _unicas
     {
         std::scoped_lock its_lock(sync_);
 
-        auto its_found = dtls_sessions_.find(its_key);
+        auto its_found = dtls_sessions_.find(its_peer);
         if (its_found != dtls_sessions_.end()) {
             if (its_found->second->is_failed() || (its_client_hello && its_found->second->is_ready())) {
                 dtls_sessions_.erase(its_found);
@@ -758,13 +757,13 @@ void udp_server_endpoint_impl::feed_dtls_unicast(const message_buffer_t& _unicas
                     });
 
             if (its_session) {
-                dtls_sessions_.emplace(its_key, its_session);
+                dtls_sessions_.emplace(its_peer, its_session);
             }
         }
     }
 
     if (!its_session) {
-        VSOMEIP_ERROR_P << instance_name_ << " Failed to initialize DTLS session for " << its_key;
+        VSOMEIP_ERROR_P << instance_name_ << " Failed to initialize DTLS session for " << dtls_peer_key(its_peer);
         return;
     }
 
@@ -778,7 +777,7 @@ void udp_server_endpoint_impl::feed_dtls_unicast(const message_buffer_t& _unicas
     }
     if (its_session->is_failed()) {
         std::scoped_lock its_lock(sync_);
-        const auto its_current = dtls_sessions_.find(its_key);
+        const auto its_current = dtls_sessions_.find(its_peer);
         if (its_current != dtls_sessions_.end() && its_current->second == its_session) {
             dtls_sessions_.erase(its_current);
         }

@@ -1150,3 +1150,46 @@ TEST_F(dtls_session_test, tls_tampered_stream_fails_the_session) {
 
 } // namespace
 
+
+// ---------------------------------------------------------------- bench -----
+// Not a test: VSOMEIP_DTLS_BENCH=<records> measures the endpoints' fast path
+// (seal() on one side, feed(..., plaintext) on the other) in thread CPU time per
+// record, without sockets, so library changes can be compared run against run.
+TEST_F(dtls_session_test, bench_seal_feed_cpu_per_record) {
+    const char* its_env = std::getenv("VSOMEIP_DTLS_BENCH");
+    if (!its_env || std::atoi(its_env) <= 0) {
+        GTEST_SKIP() << "set VSOMEIP_DTLS_BENCH=<records> to run";
+    }
+    const int its_records = std::atoi(its_env);
+    const auto thread_cpu_ns = [] {
+        timespec its_ts{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &its_ts);
+        return static_cast<std::int64_t>(its_ts.tv_sec) * 1000000000LL + its_ts.tv_nsec;
+    };
+    for (const char* cipher : {"PSK-AES128-CBC-SHA256", "PSK-AES128-GCM-SHA256"}) {
+        for (const std::size_t size : {std::size_t{64}, std::size_t{1400}}) {
+            ASSERT_TRUE(create(psk_client(cipher), psk_server(cipher)));
+            ASSERT_TRUE(handshake());
+            const auto payload = message(size, 7);
+            std::vector<datagram_t> its_records_out;
+            std::vector<datagram_t> its_plaintext;
+            its_records_out.reserve(4);
+            its_plaintext.reserve(4);
+            std::size_t its_delivered = 0;
+            const auto its_start = thread_cpu_ns();
+            for (int i = 0; i < its_records; ++i) {
+                its_records_out.clear();
+                ASSERT_TRUE(client_->seal(payload.data(), payload.size(), its_records_out));
+                for (const auto& record : its_records_out) {
+                    its_plaintext.clear();
+                    server_->feed(record.data(), record.size(), its_plaintext);
+                    its_delivered += its_plaintext.size();
+                }
+            }
+            const auto its_ns = thread_cpu_ns() - its_start;
+            ASSERT_EQ(its_delivered, static_cast<std::size_t>(its_records)) << "every record must be delivered";
+            std::printf("BENCH %s size %zu: %.0f ns per record (seal + feed), %d records\n", cipher, size,
+                        static_cast<double>(its_ns) / its_records, its_records);
+        }
+    }
+}

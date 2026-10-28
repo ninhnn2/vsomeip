@@ -6,6 +6,7 @@
 #ifndef VSOMEIP_V3_DTLS_SESSION_HPP_
 #define VSOMEIP_V3_DTLS_SESSION_HPP_
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
@@ -195,8 +196,16 @@ private:
     std::string tls_version_;
     std::size_t incoming_offset_{0};
     const char* kind() const { return stream_ ? "TLS" : "DTLS"; }
-    bool is_ready_{false};
-    bool is_failed_{false};
+    // Atomic so is_ready()/is_failed() need no lock on every send and receive.
+    std::atomic<bool> is_ready_{false};
+    std::atomic<bool> is_failed_{false};
+    // The retransmit timer is pending (only during a DTLS handshake): after it,
+    // arm_retransmit_locked() has nothing to cancel for every record.
+    bool retransmit_armed_{false};
+    // Datagram being fed (DTLS): io_recv() reads it in place instead of a copy
+    // in incoming_. Set and cleared by feed() with mutex_ held.
+    const std::uint8_t* feed_data_{nullptr};
+    std::size_t feed_size_{0};
     std::string identity_;
     std::vector<unsigned char> psk_;
     psk_resolver_t resolver_;

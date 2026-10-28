@@ -621,11 +621,18 @@ void dtls_session::feed(const std::uint8_t* _data, std::size_t _size, std::vecto
         if (is_failed_) {
             return;
         }
-        incoming_.emplace_back(_data, _data + _size);
+        if (stream_) {
+            incoming_.emplace_back(_data, _data + _size);
+        } else {
+            feed_data_ = _data;  // read in place by io_recv(), valid until drive_locked() returns
+            feed_size_ = _size;
+        }
         const bool its_timed = stats_enabled() && is_ready_;
         const std::int64_t its_start = its_timed ? now_ns() : 0;
         const std::int64_t its_cpu_start = its_timed ? thread_cpu_ns() : 0;
         drive_locked(outgoing, plaintext);
+        feed_data_ = nullptr;  // the caller's buffer is not ours beyond this call
+        feed_size_ = 0;
         if (its_timed && !plaintext.empty()) {
             g_stats.receive_ns_ += static_cast<std::uint64_t>(now_ns() - its_start);
             g_stats.receive_cpu_ns_ += static_cast<std::uint64_t>(thread_cpu_ns() - its_cpu_start);
@@ -781,12 +788,10 @@ bool dtls_session::write_locked(const std::uint8_t* _data, std::size_t _size, st
 }
 
 bool dtls_session::is_ready() const {
-    std::lock_guard<std::mutex> lock(mutex_);
     return is_ready_;
 }
 
 bool dtls_session::is_failed() const {
-    std::lock_guard<std::mutex> lock(mutex_);
     return is_failed_;
 }
 
@@ -874,10 +879,14 @@ void dtls_session::arm_retransmit_locked() {
     // Only an unfinished DTLS handshake needs our timer. After it, wolfSSL resends
     // its last flight by itself when the peer repeats its own. TLS: TCP resends.
     if (!ssl_ || is_ready_ || is_failed_ || stream_) {
-        boost::system::error_code ignored;
-        retransmit_timer_.cancel(ignored);
+        if (retransmit_armed_) {
+            boost::system::error_code ignored;
+            retransmit_timer_.cancel(ignored);
+            retransmit_armed_ = false;
+        }
         return;
     }
+    retransmit_armed_ = true;
     int its_seconds = wolfSSL_dtls_get_current_timeout(ssl_);
     if (its_seconds <= 0) {
         its_seconds = 1;
@@ -973,6 +982,19 @@ int dtls_session::io_recv(WOLFSSL*, char* _buffer, int _size, void* _context) {
     auto* session = static_cast<dtls_session*>(_context);
     if (!session || _size <= 0) {
         return WOLFSSL_CBIO_ERR_GENERAL;
+    }
+    if (!session->stream_ && session->feed_data_) {
+        // The datagram being fed, read in place. One datagram per call, as below.
+        const std::uint8_t* its_data = session->feed_data_;
+        const std::size_t its_size = session->feed_size_;
+        session->feed_data_ = nullptr;
+        session->feed_size_ = 0;
+        if (its_size > static_cast<std::size_t>(_size)) {
+            VSOMEIP_WARNING << "DTLS: dropped a " << its_size << " byte datagram larger than the read buffer";
+            return WOLFSSL_CBIO_ERR_WANT_READ;
+        }
+        std::memcpy(_buffer, its_data, its_size);
+        return static_cast<int>(its_size);
     }
     if (session->incoming_.empty()) {
         return WOLFSSL_CBIO_ERR_WANT_READ;

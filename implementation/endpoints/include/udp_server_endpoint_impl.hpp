@@ -134,7 +134,8 @@ private:
     std::map<service_t, endpoint_type> default_targets_;
 
     // One DTLS association per peer, keyed by "address:port".
-    std::map<std::string, std::shared_ptr<dtls_session>, std::less<>> dtls_sessions_;
+    // Keyed by the peer endpoint itself: no string is built per datagram.
+    std::map<endpoint_type, std::shared_ptr<dtls_session>> dtls_sessions_;
 
     boost::asio::ip::address netmask_;
     uint16_t prefix_{0};
