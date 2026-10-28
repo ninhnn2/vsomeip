@@ -246,6 +246,7 @@ public:
 
     VSOMEIP_EXPORT int get_udp_receive_buffer_size() const;
     VSOMEIP_EXPORT bool is_dtls_enabled() const override;
+    VSOMEIP_EXPORT bool is_dtls_multicast_plaintext_allowed() const override;
     VSOMEIP_EXPORT const std::string& get_dtls_psk_identity() const override;
     VSOMEIP_EXPORT const std::string& get_dtls_psk() const override;
     VSOMEIP_EXPORT const std::string& get_dtls_cipher() const override;
@@ -653,6 +654,10 @@ protected:
     std::atomic_bool is_remote_access_allowed_;
 
     bool dtls_enabled_{false};
+    bool dtls_multicast_plaintext_{false};  // "multicast-events": "deny" (default) | "plaintext"
+    // eventgroups whose multicast threshold was overridden, so the warning is logged once
+    mutable std::mutex dtls_multicast_warned_mutex_;
+    mutable std::set<std::tuple<service_t, instance_t, eventgroup_t>> dtls_multicast_warned_;
     std::string dtls_psk_identity_;
     std::string dtls_psk_;
     std::string dtls_cipher_;

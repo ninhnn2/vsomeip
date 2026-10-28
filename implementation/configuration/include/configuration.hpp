@@ -303,6 +303,11 @@ public:
     // about DTLS.
     virtual bool is_dtls_enabled() const { return false; }
 
+    // DTLS cannot protect multicast (RFC 6347/9147 are point-to-point). With DTLS on,
+    // multicast events would leave in plaintext, so they are refused unless the
+    // configuration says "dtls": { "multicast-events": "plaintext" }.
+    virtual bool is_dtls_multicast_plaintext_allowed() const { return true; }
+
     virtual const std::string& get_dtls_psk_identity() const {
         static const std::string empty;
         return empty;

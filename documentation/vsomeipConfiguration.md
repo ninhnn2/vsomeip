@@ -734,6 +734,12 @@ Both peers need this object with the same identity and key. See
   secrecy: whoever obtains the key can decrypt traffic recorded earlier.
   `ECDHE-PSK-CHACHA20-POLY1305` adds an ephemeral key exchange and is the only AEAD
   ECDHE-PSK suite OpenSSL provides. Both peers must use the same value.
+- **multicast-events** - `deny` (default) or `plaintext`. DTLS cannot protect multicast,
+  so with `deny` an eventgroup's multicast threshold is ignored (events are sent unicast
+  through each subscriber's DTLS session) and a client does not join a multicast group
+  offered in a SubscribeEventgroupAck. `plaintext` keeps the plain SOME/IP behaviour:
+  multicast events are sent and accepted without any protection. Any other value is
+  treated as `deny`.
 - **peers** - Optional list of per-peer credentials, so each pair of nodes holds its own
   key and one compromised node does not expose the other links. Each entry has
   `address` (the peer's unicast address, used to choose the credentials for outgoing

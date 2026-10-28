@@ -3265,7 +3265,21 @@ bool configuration_impl::get_multicast(service_t _service, instance_t _instance,
 
 uint8_t configuration_impl::get_threshold(service_t _service, instance_t _instance, eventgroup_t _eventgroup) const {
     std::shared_ptr<eventgroup> its_eventgroup = find_eventgroup({_service, _instance}, _eventgroup);
-    return (its_eventgroup ? its_eventgroup->threshold_ : 0);
+    const uint8_t its_threshold = (its_eventgroup ? its_eventgroup->threshold_ : 0);
+    // Threshold 0 means unicast events only (PRS_SOMEIPSD_00851) and no multicast option
+    // in the SubscribeEventgroupAck, so every event goes through the subscriber's DTLS session.
+    if (its_threshold != 0 && dtls_enabled_ && !dtls_multicast_plaintext_) {
+        std::scoped_lock its_lock(dtls_multicast_warned_mutex_);
+        if (!dtls_multicast_warned_.emplace(_service, _instance, _eventgroup).second) {
+            return 0;
+        }
+        VSOMEIP_WARNING << "DTLS: eventgroup [" << hex4(_service) << "." << hex4(_instance) << "." << hex4(_eventgroup)
+                        << "] multicast threshold " << static_cast<int>(its_threshold)
+                        << " ignored, events are sent unicast so DTLS protects them"
+                        << " (\"multicast-events\": \"plaintext\" allows unprotected multicast)";
+        return 0;
+    }
+    return its_threshold;
 }
 
 std::shared_ptr<client> configuration_impl::find_client(service_instance_t _si) const {
@@ -4475,6 +4489,15 @@ void configuration_impl::load_dtls(const configuration_element& _element) {
     try {
         const bool enabled = settings->get<bool>("enable", false);
         const std::string its_mode = settings->get<std::string>("mode", "psk");
+        // Multicast events cannot be protected by DTLS: refuse them unless explicitly allowed.
+        const std::string its_multicast = settings->get<std::string>("multicast-events", "deny");
+        dtls_multicast_plaintext_ = (its_multicast == "plaintext");
+        if (its_multicast != "deny" && its_multicast != "plaintext") {
+            VSOMEIP_ERROR << "DTLS multicast-events must be \"deny\" or \"plaintext\", got \"" << its_multicast
+                          << "\"; using \"deny\"";
+        } else if (dtls_multicast_plaintext_ && enabled) {
+            VSOMEIP_WARNING << "DTLS: multicast events are allowed and are sent WITHOUT protection";
+        }
         // "accelerator": "none" (default) or "sa2ul". Performance only: if the
         // engine is missing at run time the session uses the CPU and says so.
         dtls_accelerator_ = settings->get<std::string>("accelerator", "none");
@@ -5123,6 +5146,11 @@ int configuration_impl::get_udp_receive_buffer_size() const {
 bool configuration_impl::is_dtls_enabled() const {
 
     return dtls_enabled_;
+}
+
+bool configuration_impl::is_dtls_multicast_plaintext_allowed() const {
+
+    return dtls_multicast_plaintext_;
 }
 
 const std::string& configuration_impl::get_dtls_psk_identity() const {

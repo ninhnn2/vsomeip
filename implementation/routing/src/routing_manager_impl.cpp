@@ -6,6 +6,8 @@
 #include <climits>
 #include <iomanip>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <sstream>
 #include <forward_list>
 #include <thread>
@@ -2173,6 +2175,21 @@ void routing_manager_impl::on_remote_unsubscribe(std::shared_ptr<remote_subscrip
 void routing_manager_impl::on_subscribe_ack_with_multicast(service_t _service, instance_t _instance,
                                                            const boost::asio::ip::address& _sender,
                                                            const boost::asio::ip::address& _address, uint16_t _port) {
+    // A multicast endpoint would accept plaintext events that nobody authenticates;
+    // with DTLS the subscriber keeps receiving through its unicast DTLS session only.
+    if (configuration_->is_dtls_enabled() && !configuration_->is_dtls_multicast_plaintext_allowed()) {
+        // Every cyclic SubscribeEventgroupAck repeats the option: say it once per group.
+        static std::mutex its_warned_mutex;
+        static std::set<std::string> its_warned;
+        std::scoped_lock its_lock(its_warned_mutex);
+        if (!its_warned.insert(_sender.to_string() + "|" + _address.to_string() + ":" + std::to_string(_port)).second) {
+            return;
+        }
+        VSOMEIP_WARNING << "DTLS: not joining multicast " << _address.to_string() << ":" << _port << " offered by "
+                        << _sender.to_string() << " for [" << hex4(_service) << "." << hex4(_instance)
+                        << "]: multicast events are not protected; the server must send them unicast";
+        return;
+    }
     ep_mgr_impl_->find_or_create_multicast_endpoint(_service, _instance, _sender, _address, _port);
 }
 

@@ -1153,3 +1153,64 @@ TEST_F(test_configuration_impl, tls_block_enables_tls_and_fails_closed) {
         EXPECT_FALSE(load(dir, "routingmanager")->is_tls_enabled());
     }
 }
+
+// DTLS cannot protect multicast (RFC 6347/9147, AUTOSAR FO EXP SecurityOverview 4.4.3.2.2).
+// With DTLS on, an eventgroup's multicast threshold is ignored (events go unicast through
+// each subscriber's DTLS session) unless "multicast-events": "plaintext" says otherwise.
+TEST_F(test_configuration_impl, dtls_refuses_multicast_events_unless_allowed) {
+    const auto config_with = [](const std::string& _dtls) {
+        return std::string(R"({
+            "routing": { "host": { "name": "routingmanager" } },
+            "applications": [ { "name": "routingmanager", "id": "0x1111" } ],
+            "services": [ {
+                "service": "0x1234", "instance": "0x5678", "unicast": "192.0.2.2", "unreliable": "30509",
+                "eventgroups": [
+                    { "eventgroup": "0x0001", "threshold": "2", "events": [ "0x8001" ],
+                      "multicast": { "address": "239.1.2.3", "port": "30600" } },
+                    { "eventgroup": "0x0002", "events": [ "0x8002" ] }
+                ]
+            } ])") + _dtls + "}";
+    };
+    const std::string psk = R"("psk-identity": "lab-peer",
+        "psk-key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")";
+    {
+        SCOPED_TRACE("DTLS on, default policy: unicast only");
+        scratch_config_dir dir;
+        dir.write("vsomeip_std.json", config_with(R"(, "dtls": { "enable": true, )" + psk + " }"));
+        auto its_config = load(dir, "routingmanager");
+        ASSERT_TRUE(its_config->is_dtls_enabled());
+        EXPECT_FALSE(its_config->is_dtls_multicast_plaintext_allowed());
+        EXPECT_EQ(its_config->get_threshold(0x1234, 0x5678, 0x0001), 0) << "multicast must not bypass DTLS";
+        EXPECT_EQ(its_config->get_threshold(0x1234, 0x5678, 0x0002), 0);
+        std::string its_address;
+        uint16_t its_port(0);
+        EXPECT_TRUE(its_config->get_multicast(0x1234, 0x5678, 0x0001, its_address, its_port))
+                << "the address stays configured; only the threshold decides whether it is used";
+    }
+    {
+        SCOPED_TRACE("DTLS on, multicast explicitly allowed in plaintext");
+        scratch_config_dir dir;
+        dir.write("vsomeip_std.json",
+                  config_with(R"(, "dtls": { "enable": true, "multicast-events": "plaintext", )" + psk + " }"));
+        auto its_config = load(dir, "routingmanager");
+        EXPECT_TRUE(its_config->is_dtls_multicast_plaintext_allowed());
+        EXPECT_EQ(its_config->get_threshold(0x1234, 0x5678, 0x0001), 2);
+    }
+    {
+        SCOPED_TRACE("unknown policy falls back to deny");
+        scratch_config_dir dir;
+        dir.write("vsomeip_std.json",
+                  config_with(R"(, "dtls": { "enable": true, "multicast-events": "allow", )" + psk + " }"));
+        auto its_config = load(dir, "routingmanager");
+        EXPECT_FALSE(its_config->is_dtls_multicast_plaintext_allowed());
+        EXPECT_EQ(its_config->get_threshold(0x1234, 0x5678, 0x0001), 0);
+    }
+    {
+        SCOPED_TRACE("DTLS off: plain SOME/IP keeps its multicast threshold");
+        scratch_config_dir dir;
+        dir.write("vsomeip_std.json", config_with(""));
+        auto its_config = load(dir, "routingmanager");
+        EXPECT_FALSE(its_config->is_dtls_enabled());
+        EXPECT_EQ(its_config->get_threshold(0x1234, 0x5678, 0x0001), 2);
+    }
+}

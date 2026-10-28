@@ -300,12 +300,41 @@ run AES-CBC) or `"1.3"` (`TLS13-AES128-GCM-SHA256` unless `"cipher"` says otherw
   with `"tls"` on, a connection without a ready session sends nothing.
 - Magic cookies are not used with TLS: the record layer already detects corruption.
 
+## Multicast events
+
+DTLS (RFC 6347, RFC 9147) is a session between two peers and cannot carry multicast;
+AUTOSAR lists this among its disadvantages (FO EXP SecurityOverview 4.4.3.2.2) and notes
+that TLS therefore cannot protect SOME/IP-SD (4.4.3.2.1). SOME/IP-SD itself is mixed:
+Subscribe/Stop/Ack/Nack entries are unicast only (PRS_SOMEIPSD_00472), offers and finds
+are multicast or unicast, and SD always uses the shared SD port, so it stays outside DTLS.
+
+Events are unicast per subscriber unless an eventgroup has a multicast address and a
+multicast threshold (PRS_SOMEIPSD_00134, 00851): threshold 1 always multicasts, n > 1
+switches to multicast at n subscribers. Such events would leave the DTLS-protected
+socket in clear text, and a subscriber that joins the group accepts anything sent to it.
+
+With DTLS on, both are refused unless the configuration says otherwise:
+
+- Server: the threshold of every eventgroup is treated as 0, so events go unicast through
+  each subscriber's DTLS session and the SubscribeEventgroupAck carries no multicast
+  option. Logged once per eventgroup: `DTLS: eventgroup [...] multicast threshold n ignored`.
+- Client: a multicast option in a SubscribeEventgroupAck (from a server that still
+  multicasts) is not joined, so no unauthenticated event reaches the application; the
+  client then receives no events from that server. Logged once per group.
+- `"dtls": { "multicast-events": "plaintext" }` restores the plain SOME/IP behaviour on
+  both sides and logs that multicast events are sent without protection.
+
+The cost of unicast is one encrypted record per subscriber per event instead of one
+datagram. Where that is too much, multicast needs a mechanism that supports groups,
+for example SecOC (authenticity, payload only) or MACsec (layer 2, per link).
+`fcam-dtls-bench/tests/multicast-netns.sh` checks all four combinations on the wire.
+
 ## Scope and limitations
 
 - Protected: UDP unicast service data on configured service endpoints; with `"tls"`, TCP
   service data.
 - Not protected: SOME/IP Service Discovery and any other multicast traffic; TCP unless
-  `"tls"` is enabled.
+  `"tls"` is enabled. See [Multicast events](#multicast-events).
 - Authentication: a PSK (node-wide, or one key per peer pair through `peers`), or X.509
   certificates with `"mode": "certificate"` — see [DTLS with X.509 certificates](dtls-certificate.md).
   Keys can come from a file, inline, or a `key-command`; certificate private keys also
